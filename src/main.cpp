@@ -18,6 +18,7 @@ int main()
             for (auto [refer, msg] : errors)
                 std::cerr << refer.value() << ": " << msg << std::endl;
 
+            std::cout << std::endl;
             for (auto row : worksheet)
             {
                 for (auto cell : row)
