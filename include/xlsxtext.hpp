@@ -1,11 +1,7 @@
 #pragma once
 
-// #define USE_PUGIXML
-
 #include "miniz/miniz.h"
-#ifdef USE_PUGIXML
 #include "pugixml/pugixml.hpp"
-#endif
 
 #include <cstring>
 #include <string>
@@ -15,330 +11,6 @@
 
 namespace xlsxtext
 {
-#ifndef USE_PUGIXML
-    namespace internal
-    {
-        class xml_reader
-        {
-        public:
-            enum class node_type
-            {
-                null,
-                error,
-                element_start,
-                element_end,
-                element,
-                text,
-            };
-            static std::string text(std::string_view value) noexcept
-            {
-                std::string text = std::string(value);
-                for (std::string::size_type i = 0; i < text.size(); ++i)
-                {
-                    if (text[i] == '&')
-                    {
-                        if (i <= text.size() - 6 && text[i + 1] == 'a' && text[i + 2] == 'p' && text[i + 3] == 'o' && text[i + 4] == 's' && text[i + 5] == ';')
-                            text.replace(i, 6, "'");
-                        else if (i <= text.size() - 5 && text[i + 1] == 'a' && text[i + 2] == 'm' && text[i + 3] == 'p' && text[i + 4] == ';')
-                            text.replace(i, 5, "&");
-                        else if (i <= text.size() - 6 && text[i + 1] == 'q' && text[i + 2] == 'u' && text[i + 3] == 'o' && text[i + 4] == 't' && text[i + 5] == ';')
-                            text.replace(i, 6, "\"");
-                        else if (i <= text.size() - 4 && text[i + 1] == 'l' && text[i + 2] == 't' && text[i + 3] == ';')
-                            text.replace(i, 4, "<");
-                        else if (i <= text.size() - 4 && text[i + 1] == 'g' && text[i + 2] == 't' && text[i + 3] == ';')
-                            text.replace(i, 4, ">");
-                        else if (i <= text.size() - 4 && text[i + 1] == '#')
-                        {
-                            bool ok = true;
-                            unsigned code = 0, base = 10;
-                            auto pos = i + 2;
-                            if (text[pos] == 'x')
-                            {
-                                base = 16;
-                                ++pos;
-                            }
-                            for (auto ch = text[pos]; pos < text.size() && ch != ';'; ch = text[++pos])
-                            {
-                                code *= base;
-                                if (ch >= '0' && ch <= '9')
-                                    code += ch - '0';
-                                else if (base == 16 && ch - 'A' <= 5)
-                                    code += ch - 'A' + 10;
-                                else if (base == 16 && ch - 'a' <= 5)
-                                    code += ch - 'a' + 10;
-                                else
-                                {
-                                    ok = false;
-                                    break;
-                                }
-                            }
-                            if (ok && pos < text.size() && text[pos] == ';')
-                            {
-                                char str[4] = {};
-                                if (code < 0x80)
-                                {
-                                    str[0] = static_cast<uint8_t>(code);
-                                }
-                                else if (code < 0x800)
-                                {
-                                    str[0] = static_cast<uint8_t>(0xC0 | (code >> 6));
-                                    str[1] = static_cast<uint8_t>(0x80 | (code & 0x3F));
-                                }
-                                else if (code <= 0xFFFF)
-                                {
-                                    str[0] = static_cast<uint8_t>(0xE0 | (code >> 12));
-                                    str[1] = static_cast<uint8_t>(0x80 | ((code >> 6) & 0x3F));
-                                    str[2] = static_cast<uint8_t>(0x80 | (code & 0x3F));
-                                }
-                                else
-                                {
-                                    str[0] = static_cast<uint8_t>(0xF0 | (code >> 18));
-                                    str[1] = static_cast<uint8_t>(0x80 | ((code >> 12) & 0x3F));
-                                    str[2] = static_cast<uint8_t>(0x80 | ((code >> 6) & 0x3F));
-                                    str[3] = static_cast<uint8_t>(0x80 | (code & 0x3F));
-                                }
-                                text.replace(i, pos - i + 1, str);
-                            }
-                        }
-                    }
-                }
-                return text;
-            }
-
-        private:
-            std::string_view _data;
-            std::string_view::size_type _pos;
-
-        public:
-            xml_reader(std::string_view data, std::string_view::size_type pos = 0) noexcept : _data(data), _pos(pos) {}
-
-        private:
-            node_type _type = node_type::null;
-            std::string_view _name;
-            std::map<std::string_view, std::string_view> _attributes;
-            std::string_view _value;
-
-            std::vector<std::string_view> _tree;
-
-            void reset() noexcept
-            {
-                _type = node_type::null;
-                _name = _value = _data.substr(0, 0);
-                _attributes.clear();
-            }
-
-            bool is_name_char(unsigned char c, bool first = false) const noexcept { return ('A' <= c && c <= 'Z') || ('a' <= c && c <= 'z') || c == '_' || c > 127 || (!first && (('0' <= c && c <= '9') || c == ':' || c == '-' || c == '.')); }
-            bool is_space_char(unsigned char c) const noexcept { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; }
-
-        public:
-            node_type type() const noexcept { return _type; }
-            std::string_view name() const noexcept { return _name; }
-            std::map<std::string_view, std::string_view> attributes() const noexcept { return _attributes; }
-            std::string_view value() const noexcept { return _value; }
-
-            bool read() noexcept
-            {
-                if (_type == node_type::error)
-                    return false;
-
-                if (_type == node_type::element_start)
-                    _tree.push_back(_name);
-
-                reset();
-
-                auto size = _data.size();
-                while (_pos < size)
-                {
-                    auto pos = _pos;
-                    while (pos < size && is_space_char(_data[pos]))
-                        ++pos;
-                    if (pos >= size)
-                    {
-                        _pos = pos;
-                        return false;
-                    }
-                    if (_data[pos] != '<')
-                    {
-                        _type = node_type::text;
-                        while (pos < size && _data[pos] != '<')
-                            ++pos;
-                        _value = _data.substr(_pos, pos - _pos);
-                        _pos = pos;
-                        return true;
-                    }
-                    else
-                    {
-                        /**
-                         * <?xxx?>
-                         * <!x>
-                         * <![CDATA["xxxxx"]]>
-                         * <!--xxx-->
-                         */
-                        _type = node_type::error;
-                        _pos = pos++;
-
-                        if (pos > size - 3) // <x/>
-                            return false;
-                        if (_data[pos] == '?')
-                        {
-                            ++pos;
-                            char quote = 0;
-                            while (pos < size - 1 && (quote || _data[pos] != '?' || _data[pos + 1] != '>'))
-                            {
-                                if (_data[pos] == '"' || _data[pos] == '\'')
-                                    quote = quote == 0 ? _data[pos] : quote == _data[pos] ? 0 : quote;
-                                ++pos;
-                            }
-                            if (quote || pos > size - 2)
-                                return false;
-                            _pos = pos + 2;
-                            continue;
-                        }
-                        else if (_data[pos] == '!')
-                        {
-                            if (_data[pos + 1] == '[')
-                            {
-                                pos += 2;
-                                while (pos < size - 2 && (_data[pos] != ']' || _data[pos + 1] != ']' || _data[pos + 2] != '>'))
-                                    ++pos;
-                                if (pos > size - 3)
-                                    return false;
-                                _pos = pos + 3;
-                                continue;
-                            }
-                            else if (_data[pos + 1] == '-' && _data[pos + 2] == '-')
-                            {
-                                pos += 3;
-                                while (pos < size - 2 && (_data[pos] != '-' || _data[pos + 1] != '-' || _data[pos + 2] != '>'))
-                                    ++pos;
-                                if (pos > size - 3)
-                                    return false;
-                                _pos = pos + 3;
-                                continue;
-                            }
-                            else
-                            {
-                                ++pos;
-                                char quote = 0;
-                                while (pos < size && (quote || _data[pos] != '>'))
-                                {
-                                    if (_data[pos] == '"' || _data[pos] == '\'')
-                                        quote = quote == 0 ? _data[pos] : quote == _data[pos] ? 0 : quote;
-                                    ++pos;
-                                }
-                                if (pos >= size)
-                                    return false;
-                                _pos = pos + 1;
-                                continue;
-                            }
-                        }
-
-                        if (is_name_char(_data[pos], true))
-                        {
-                            while (pos < size && is_name_char(_data[pos])) // skip name
-                                ++pos;
-                            if (pos > size - 2 || (!is_space_char(_data[pos]) && _data[pos] != '/' && _data[pos] != '>'))
-                                return false;
-                            decltype(_name) name = _data.substr(_pos + 1, pos - _pos - 1);
-
-                            decltype(_attributes) attributes;
-                            while (pos < size) // read attributes
-                            {
-                                while (pos < size && is_space_char(_data[pos])) // skip space
-                                    ++pos;
-                                if (pos > size - 2 || (!is_name_char(_data[pos], true) && _data[pos] != '/' && _data[pos] != '>'))
-                                    return false;
-
-                                if (_data[pos] == '/' || _data[pos] == '>')
-                                    break;
-
-                                decltype(size) key_pos = pos++, key_size = 0;
-                                while (pos < size && is_name_char(_data[pos])) // skip name
-                                    ++pos;
-                                if (pos > size - 2)
-                                    return false;
-                                key_size = pos - key_pos;
-
-                                while (pos < size && is_space_char(_data[pos])) // skip space
-                                    ++pos;
-                                if (pos > size - 5 || _data[pos] != '=') //=""/> or =''/>
-                                    return false;
-
-                                ++pos;
-                                while (pos < size && is_space_char(_data[pos])) // skip space
-                                    ++pos;
-                                if (pos > size - 4 || (_data[pos] != '\'' && _data[pos] != '\"')) //""/> or ''/>
-                                    return false;
-
-                                ++pos;
-                                auto sign = _data[pos - 1];
-                                decltype(size) value_pos = pos, value_size = 0;
-                                while (pos < size && _data[pos] != sign) // "/> or '/>
-                                    ++pos;
-                                if (pos > size - 3 || _data[pos] != sign)
-                                    return false;
-                                value_size = pos - value_pos;
-
-                                ++pos;
-                                if (!is_space_char(_data[pos]) && _data[pos] != '/' && _data[pos] != '>')
-                                    return false;
-
-                                attributes[_data.substr(key_pos, key_size)] = _data.substr(value_pos, value_size);
-                            }
-                            if (pos > size - 2 || (_data[pos] != '>' && (_data[pos] != '/' || _data[pos + 1] != '>'))) // not end with '>' or '/>'
-                                return false;
-
-                            if (_data[pos] == '>')
-                            {
-                                _type = node_type::element_start;
-                                _pos = pos + 1;
-                            }
-                            else
-                            {
-                                _type = node_type::element;
-                                _pos = pos + 2;
-                            }
-                            _name = name;
-                            _attributes = attributes;
-                            return true;
-                        }
-                        else if (_data[pos] == '/')
-                        {
-                            if (!is_name_char(_data[pos + 1], true))
-                            {
-                                _type = node_type::error;
-                                return false;
-                            }
-
-                            pos += 2;
-                            while (pos < size && is_name_char(_data[pos]))
-                                ++pos;
-                            if (pos >= size)
-                                return false;
-
-                            auto name = _data.substr(_pos + 2, pos - _pos - 2);
-                            if (_tree.size() <= 0 || _tree[_tree.size() - 1] != name)
-                                return false;
-
-                            while (pos < size && is_space_char(_data[pos]))
-                                ++pos;
-                            if (pos >= size || _data[pos] != '>')
-                                return false;
-
-                            _tree.pop_back();
-                            _pos = pos + 1;
-                            _type = node_type::element_end;
-                            _name = name;
-                            return true;
-                        }
-                    }
-                }
-                return false;
-            }
-        };
-    } // namespace internal
-#endif
-
     class reference
     {
     public:
@@ -599,7 +271,6 @@ namespace xlsxtext
                  *     </mergeCells>
                  * <worksheet>
                  */
-#ifdef USE_PUGIXML
                 pugi::xml_document doc;
                 auto result = doc.load_buffer(buffer, size);
                 mz_free(buffer);
@@ -668,86 +339,6 @@ namespace xlsxtext
                     if (cells.size())
                         _rows.push_back(cells);
                 }
-#else
-                using internal::xml_reader;
-
-                xml_reader reader(std::string_view((const char *)buffer, size));
-                char path[6] = {}, depth = 0;
-
-                std::vector<cell> cells;
-                std::string r, t, s, v, iv;
-                while (reader.read())
-                {
-                    auto type = reader.type();
-                    if (type == xml_reader::node_type::element || type == xml_reader::node_type::element_start || type == xml_reader::node_type::element_end)
-                    {
-                        auto name = reader.name();
-                        if (type == xml_reader::node_type::element || type == xml_reader::node_type::element_start)
-                        {
-                            if (depth == 2 && path[0] == 1 && path[1] == 2 && name == "mergeCell")
-                            {
-                                if (auto refs = reader.attributes()["ref"]; refs != "")
-                                {
-                                    if (auto split = refs.find(':'); split != std::string::npos && split < refs.size() - 1)
-                                        _merge_cells.push_back({std::string(refs.substr(0, split)), std::string(refs.substr(split + 1)), ""});
-                                }
-                            }
-                            else if (depth == 3 && path[0] == 1 && path[1] == 1 && path[2] == 1 && name == "c")
-                            {
-                                auto attributes = reader.attributes();
-                                r = attributes["r"], t = attributes["t"], s = attributes["s"];
-                            }
-                        }
-                        if (type == xml_reader::node_type::element || type == xml_reader::node_type::element_end)
-                        {
-                            if (depth == 4 && path[0] == 1 && path[1] == 1 && path[2] == 1 && path[3] == 1 && name == "c")
-                            {
-                                std::string value = read_value(r, v, t, s, errors);
-                                cells.push_back(cell(r, value));
-                                r = t = s = v = iv = "";
-                            }
-                            if (depth == 3 && path[0] == 1 && path[1] == 1 && path[2] == 1 && name == "row")
-                            {
-                                if (cells.size() > 0)
-                                    _rows.push_back(cells);
-                                cells.clear();
-                            }
-                        }
-
-                        if (type == xml_reader::node_type::element_start)
-                        {
-                            if (depth == 0)
-                                path[depth] = name == "worksheet" ? 1 : 0;
-                            else if (depth == 1)
-                                path[depth] = name == "sheetData" ? 1 : name == "mergeCells" ? 2 : 0;
-                            else if (depth == 2)
-                                path[depth] = name == "row" ? 1 : 0;
-                            else if (depth == 3)
-                                path[depth] = name == "c" ? 1 : 0;
-                            else if (depth == 4)
-                                path[depth] = name == "v" ? 1 : name == "is" ? 2 : 0;
-                            else if (depth == 5)
-                                path[depth] = name == "t" ? 1 : 0;
-                            ++depth;
-                        }
-                        else if (type == xml_reader::node_type::element_end)
-                        {
-                            --depth;
-                        }
-                    }
-                    else if (type == xml_reader::node_type::text)
-                    {
-                        if (path[0] == 1 && path[1] == 1 && path[2] == 1 && path[3] == 1)
-                        {
-                            if (depth == 5 && path[4] == 1)
-                                v = xml_reader::text(reader.value());
-                            else if (depth == 6 && path[4] == 2 && path[5] == 1)
-                                iv += xml_reader::text(reader.value());
-                        }
-                    }
-                }
-                mz_free(buffer);
-#endif
                 return errors;
             }
             return errors;
@@ -783,12 +374,7 @@ namespace xlsxtext
             size_t size = 0;
             void *buffer = nullptr;
 
-#ifdef USE_PUGIXML
             pugi::xml_document doc;
-#else
-            using internal::xml_reader;
-#endif
-
             if (buffer = mz_zip_reader_extract_file_to_heap(&_package->archive, "_rels/.rels", &size, 0))
             {
                 /**
@@ -813,7 +399,6 @@ namespace xlsxtext
                  *     <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
                  * </Relationships>
                  */
-#ifdef USE_PUGIXML
                 auto result = doc.load_buffer(buffer, size);
                 mz_free(buffer);
                 if (!result)
@@ -828,44 +413,6 @@ namespace xlsxtext
                         break;
                     }
                 }
-#else
-                xml_reader reader(std::string_view((const char *)buffer, size));
-                char path[1] = {}, depth = 0;
-
-                while (reader.read())
-                {
-                    auto type = reader.type();
-                    if (type == xml_reader::node_type::element || type == xml_reader::node_type::element_start || type == xml_reader::node_type::element_end)
-                    {
-                        auto name = reader.name();
-                        if (type == xml_reader::node_type::element || type == xml_reader::node_type::element_start)
-                        {
-                            if (depth == 1 && path[0] == 1 && name == "Relationship")
-                            {
-                                auto attributes = reader.attributes();
-                                if (auto type = attributes["Type"], target = attributes["Target"];
-                                    target != "" && type == "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument")
-                                {
-                                    workbook_part = target;
-                                    break;
-                                }
-                            }
-                        }
-
-                        if (type == xml_reader::node_type::element_start)
-                        {
-                            if (depth == 0)
-                                path[depth] = name == "Relationships" ? 1 : 0;
-                            ++depth;
-                        }
-                        else if (type == xml_reader::node_type::element_end)
-                        {
-                            --depth;
-                        }
-                    }
-                }
-                mz_free(buffer);
-#endif
             }
             if (buffer = mz_zip_reader_extract_file_to_heap(&_package->archive, "xl/_rels/workbook.xml.rels", &size, 0))
             {
@@ -894,7 +441,6 @@ namespace xlsxtext
                  *     <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
                  * </Relationships>
                  */
-#ifdef USE_PUGIXML
                 auto result = doc.load_buffer(buffer, size);
                 mz_free(buffer);
                 if (!result)
@@ -914,48 +460,6 @@ namespace xlsxtext
                             sheets[id.value()] = std::string("xl/") + target.value();
                     }
                 }
-#else
-                xml_reader reader(std::string_view((const char *)buffer, size));
-                char path[1] = {}, depth = 0;
-
-                shared_strings_part = styles_part = "";
-                while (reader.read())
-                {
-                    auto type = reader.type();
-                    if (type == xml_reader::node_type::element || type == xml_reader::node_type::element_start || type == xml_reader::node_type::element_end)
-                    {
-                        auto name = reader.name();
-                        if (type == xml_reader::node_type::element || type == xml_reader::node_type::element_start)
-                        {
-                            if (depth == 1 && path[0] == 1 && name == "Relationship")
-                            {
-                                auto attributes = reader.attributes();
-                                if (auto id = attributes["Id"], type = attributes["Type"], target = attributes["Target"]; id != "" && target != "")
-                                {
-                                    if (type == "http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings")
-                                        shared_strings_part = "xl/" + std::string(target);
-                                    else if (type == "http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles")
-                                        styles_part = "xl/" + std::string(target);
-                                    else if (type == "http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet")
-                                        sheets[std::string(id)] = "xl/" + std::string(target);
-                                }
-                            }
-                        }
-
-                        if (type == xml_reader::node_type::element_start)
-                        {
-                            if (depth == 0)
-                                path[depth] = name == "Relationships" ? 1 : 0;
-                            ++depth;
-                        }
-                        else if (type == xml_reader::node_type::element_end)
-                        {
-                            --depth;
-                        }
-                    }
-                }
-                mz_free(buffer);
-#endif
             }
             if (shared_strings_part != "" && (buffer = mz_zip_reader_extract_file_to_heap(&_package->archive, shared_strings_part.c_str(), &size, 0)))
             {
@@ -993,7 +497,6 @@ namespace xlsxtext
                  *     <si><t>cd</t></si>
                  * </sst>
                  */
-#ifdef USE_PUGIXML
                 auto result = doc.load_buffer(buffer, size);
                 mz_free(buffer);
                 if (!result)
@@ -1011,49 +514,6 @@ namespace xlsxtext
                         t = si.child("t").text().get();
                     _package->shared_strings.push_back(t);
                 }
-#else
-                xml_reader reader(std::string_view((const char *)buffer, size));
-                char path[4] = {}, depth = 0;
-
-                std::string text;
-                while (reader.read())
-                {
-                    auto type = reader.type();
-                    if (type == xml_reader::node_type::element || type == xml_reader::node_type::element_start || type == xml_reader::node_type::element_end)
-                    {
-                        auto name = reader.name();
-                        if (type == xml_reader::node_type::element_start)
-                        {
-                            if (depth == 0)
-                                path[depth] = name == "sst" ? 1 : 0;
-                            else if (depth == 1)
-                                path[depth] = name == "si" ? 1 : 0;
-                            else if (depth == 2)
-                                path[depth] = name == "t" ? 1 : name == "r" ? 2 : 0;
-                            else if (depth == 3)
-                                path[depth] = name == "t" ? 1 : 0;
-                            ++depth;
-                        }
-                        else if (type == xml_reader::node_type::element_end)
-                        {
-                            if (depth == 2 && path[0] == 1 && path[1] == 1 && name == "si")
-                            {
-                                _package->shared_strings.push_back(text);
-                                text = "";
-                            }
-                            --depth;
-                        }
-                    }
-                    else if (type == xml_reader::node_type::text)
-                    {
-                        if (depth == 3 && path[0] == 1 && path[1] == 1 && path[2] == 1)
-                            text = xml_reader::text(reader.value());
-                        else if (depth == 4 && path[0] == 1 && path[1] == 1 && path[2] == 2 && path[3] == 1)
-                            text += xml_reader::text(reader.value());
-                    }
-                }
-                mz_free(buffer);
-#endif
             }
             if (styles_part != "" && (buffer = mz_zip_reader_extract_file_to_heap(&_package->archive, styles_part.c_str(), &size, 0)))
             {
@@ -1104,7 +564,6 @@ namespace xlsxtext
                  *     </cellXfs>
                  * </styleSheet>
                  */
-#ifdef USE_PUGIXML
                 auto result = doc.load_buffer(buffer, size);
                 mz_free(buffer);
                 if (!result)
@@ -1123,51 +582,6 @@ namespace xlsxtext
                             _package->cell_xfs.push_back(std::stol(id.value()));
                     }
                 }
-#else
-                xml_reader reader(std::string_view((const char *)buffer, size));
-                char path[2] = {}, depth = 0;
-
-                while (reader.read())
-                {
-                    auto type = reader.type();
-                    if (type == xml_reader::node_type::element || type == xml_reader::node_type::element_start || type == xml_reader::node_type::element_end)
-                    {
-                        auto name = reader.name();
-                        if (type == xml_reader::node_type::element || type == xml_reader::node_type::element_start)
-                        {
-                            if (depth == 2 && path[0] == 1)
-                            {
-                                if (path[1] == 1 && name == "numFmt")
-                                {
-                                    auto attributes = reader.attributes();
-                                    if (auto id = attributes["numFmtId"], code = attributes["formatCode"]; id != "" && code != "")
-                                        _package->numfmts[std::stol(std::string(id))] = xml_reader::text(code);
-                                }
-                                else if (path[1] == 2 && name == "xf")
-                                {
-                                    auto attributes = reader.attributes();
-                                    if (auto id = attributes["numFmtId"]; id != "")
-                                        _package->cell_xfs.push_back(std::stol(std::string(id)));
-                                }
-                            }
-                        }
-
-                        if (type == xml_reader::node_type::element_start)
-                        {
-                            if (depth == 0)
-                                path[depth] = name == "styleSheet" ? 1 : 0;
-                            else if (depth == 1)
-                                path[depth] = name == "numFmts" ? 1 : name == "cellXfs" ? 2 : 0;
-                            ++depth;
-                        }
-                        else if (type == xml_reader::node_type::element_end)
-                        {
-                            --depth;
-                        }
-                    }
-                }
-                mz_free(buffer);
-#endif
             }
             if (buffer = mz_zip_reader_extract_file_to_heap(&_package->archive, workbook_part.c_str(), &size, 0))
             {
@@ -1199,7 +613,6 @@ namespace xlsxtext
                  *     </sheets>
                  * </workbook>
                  */
-#ifdef USE_PUGIXML
                 auto result = doc.load_buffer(buffer, size);
                 mz_free(buffer);
                 if (!result)
@@ -1214,47 +627,6 @@ namespace xlsxtext
                             _worksheets.push_back(worksheet::create(name.value(), part, _package));
                     }
                 }
-#else
-                xml_reader reader(std::string_view((const char *)buffer, size));
-                char path[2] = {}, depth = 0;
-
-                while (reader.read())
-                {
-                    auto type = reader.type();
-                    if (type == xml_reader::node_type::element || type == xml_reader::node_type::element_start || type == xml_reader::node_type::element_end)
-                    {
-                        auto name = reader.name();
-                        if (type == xml_reader::node_type::element || type == xml_reader::node_type::element_start)
-                        {
-                            if (depth == 2 && path[0] == 1 && path[1] == 1 && name == "sheet")
-                            {
-                                auto attributes = reader.attributes();
-                                if (auto name = std::string(attributes["name"]), rid = std::string(attributes["r:id"]);
-                                    name != "" && rid != "" && sheets.find(rid) != sheets.end())
-                                {
-                                    const auto &part = sheets[rid];
-                                    if (mz_zip_reader_locate_file(&_package->archive, part.c_str(), nullptr, 0) != -1)
-                                        _worksheets.push_back(worksheet::create(name, part, _package));
-                                }
-                            }
-                        }
-
-                        if (type == xml_reader::node_type::element_start)
-                        {
-                            if (depth == 0)
-                                path[depth] = name == "workbook" ? 1 : 0;
-                            else if (depth == 1)
-                                path[depth] = name == "sheets" ? 1 : 0;
-                            ++depth;
-                        }
-                        else if (type == xml_reader::node_type::element_end)
-                        {
-                            --depth;
-                        }
-                    }
-                }
-                mz_free(buffer);
-#endif
             }
 
             return true;
