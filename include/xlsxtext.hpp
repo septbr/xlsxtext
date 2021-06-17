@@ -272,8 +272,7 @@ namespace xlsxtext
                  * <worksheet>
                  */
                 pugi::xml_document doc;
-                auto result = doc.load_buffer(buffer, size);
-                mz_free(buffer);
+                auto result = doc.load_buffer_inplace_own(buffer, size);
                 if (!result)
                 {
                     errors.push_back({_name, "open failed"});
@@ -337,7 +336,7 @@ namespace xlsxtext
                     }
 
                     if (cells.size())
-                        _rows.push_back(cells);
+                        _rows.push_back(std::move(cells));
                 }
                 return errors;
             }
@@ -399,8 +398,7 @@ namespace xlsxtext
                  *     <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
                  * </Relationships>
                  */
-                auto result = doc.load_buffer(buffer, size);
-                mz_free(buffer);
+                auto result = doc.load_buffer_inplace_own(buffer, size);
                 if (!result)
                     return false;
 
@@ -441,8 +439,7 @@ namespace xlsxtext
                  *     <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
                  * </Relationships>
                  */
-                auto result = doc.load_buffer(buffer, size);
-                mz_free(buffer);
+                auto result = doc.load_buffer_inplace_own(buffer, size);
                 if (!result)
                     return false;
 
@@ -497,8 +494,7 @@ namespace xlsxtext
                  *     <si><t>cd</t></si>
                  * </sst>
                  */
-                auto result = doc.load_buffer(buffer, size);
-                mz_free(buffer);
+                auto result = doc.load_buffer_inplace_own(buffer, size);
                 if (!result)
                     return false;
 
@@ -564,8 +560,7 @@ namespace xlsxtext
                  *     </cellXfs>
                  * </styleSheet>
                  */
-                auto result = doc.load_buffer(buffer, size);
-                mz_free(buffer);
+                auto result = doc.load_buffer_inplace_own(buffer, size);
                 if (!result)
                     return false;
 
@@ -613,8 +608,7 @@ namespace xlsxtext
                  *     </sheets>
                  * </workbook>
                  */
-                auto result = doc.load_buffer(buffer, size);
-                mz_free(buffer);
+                auto result = doc.load_buffer_inplace_own(buffer, size);
                 if (!result)
                     return false;
 

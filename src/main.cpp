@@ -4,8 +4,17 @@
 #include <cstring>
 #include <ctime>
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 int main()
 {
+#ifdef _WIN32
+    auto __ConOutCP = GetConsoleOutputCP();
+    SetConsoleOutputCP(CP_UTF8);
+#endif
+
     clock_t start = clock();
     xlsxtext::workbook workbook("../doc/zip.xlsx");
     workbook.read();
@@ -35,5 +44,8 @@ int main()
     }
     std::cout << clock() - start << std::endl;
 
+#ifdef _WIN32
+    SetConsoleOutputCP(__ConOutCP);
+#endif
     return 0;
 }
