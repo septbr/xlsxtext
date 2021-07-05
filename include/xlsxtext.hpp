@@ -125,7 +125,7 @@ namespace xlsxtext
         static worksheet create(const std::string &name, const std::string &part, std::shared_ptr<package> package) noexcept { return worksheet(name, part, package); }
 
     private:
-        std::string read_value(const reference &refer, const std::string &v, const std::string &t, const std::string &s, std::vector<std::pair<reference, std::string>> &errors) const
+        std::string read_value(const std::string &v, const std::string &t, const std::string &s, std::string &error) const
         {
             if (t == "n" || t == "str" || t == "inlineStr")
             {
@@ -142,11 +142,11 @@ namespace xlsxtext
             }
             else if (t == "d")
             {
-                errors.push_back({refer, "date type is not supported"});
+                error = "date type is not supported";
             }
             else if (t == "e")
             {
-                errors.push_back({refer, "date type is not supported"});
+                error = "date type is not supported";
             }
             else
             {
@@ -159,19 +159,19 @@ namespace xlsxtext
                 if (code == "General" || code == "@")
                     return v;
                 else
-                    errors.push_back({refer, "the numFmt code:\"" + code + "\"is not supported"});
+                    error = "the numFmt code:\"" + code + "\"is not supported";
             }
             return "";
         }
 
     public:
         std::string name() const noexcept { return _name; }
-        std::vector<std::pair<reference, std::string>> read()
+        std::map<std::string, std::string> read()
         {
             _merge_cells.clear();
             _rows.clear();
 
-            std::vector<std::pair<reference, std::string>> errors;
+            std::map<std::string, std::string> errors;
 
             void *buffer = nullptr;
             size_t size = 0;
@@ -275,7 +275,7 @@ namespace xlsxtext
                 auto result = doc.load_buffer_inplace_own(buffer, size);
                 if (!result)
                 {
-                    errors.push_back({_name, "open failed"});
+                    errors[_name] = "workseet open failed";
                     return errors;
                 }
 
@@ -330,15 +330,15 @@ namespace xlsxtext
                                 v = is.child("t").text().get();
                         }
 
-                        std::string value = read_value(refer, v, t, s, errors);
-                        if (value != "")
-                            cells.push_back(cell(refer, value));
+                        std::string error, value = read_value(v, t, s, error);
+                        if (error != "")
+                            errors[refer.value()] = error;
+                        cells.push_back(cell(refer, value));
                     }
 
                     if (cells.size())
                         _rows.push_back(std::move(cells));
                 }
-                return errors;
             }
             return errors;
         }
