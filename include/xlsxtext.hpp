@@ -298,7 +298,7 @@ namespace xlsxtext
                     std::vector<cell> cells;
                     for (auto c = row.child("c"); c; c = c.next_sibling("c"))
                     {
-                        reference refer(row.attribute("r").value()); // "r" is optional
+                        reference refer(c.attribute("r").value()); // "r" is optional
                         if (!refer)
                         {
                             refer.row = row_index;
