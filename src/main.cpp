@@ -25,7 +25,7 @@ int main()
         {
             auto errors = worksheet.read();
             for (auto [refer, msg] : errors)
-                std::cerr << refer.value() << ": " << msg << std::endl;
+                std::cerr << refer << ": " << msg << std::endl;
 
             std::cout << std::endl;
             for (auto row : worksheet)
