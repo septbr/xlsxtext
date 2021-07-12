@@ -330,7 +330,7 @@ namespace xlsxtext
                                 v = is.child("t").text().get();
                         }
 
-                        std::string error, value = c.find_child("f") ? v : read_value(v, t, s, error);
+                        std::string error, value = c.child("f") ? v : read_value(v, t, s, error);
                         if (error != "")
                             errors[refer.value()] = error;
                         cells.push_back(cell(refer, value));
