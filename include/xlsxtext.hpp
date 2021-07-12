@@ -146,7 +146,7 @@ namespace xlsxtext
             }
             else if (t == "e")
             {
-                error = "date type is not supported";
+                error = "cell error";
             }
             else
             {
