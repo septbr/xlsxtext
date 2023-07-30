@@ -24,8 +24,8 @@ int main()
         try
         {
             auto errors = worksheet.read();
-            for (auto [refer, msg] : errors)
-                std::cerr << refer << ": " << msg << std::endl;
+            for (auto kv : errors)
+                std::cerr << kv.first << ": " << kv.second << std::endl;
 
             std::cout << std::endl;
             for (auto row : worksheet)
