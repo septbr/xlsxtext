@@ -208,8 +208,7 @@ namespace xlsxtext
                 number,
                 datetime,
                 end_section,
-                end
-            } type = token_type::end;
+            } type = token_type::end_section;
 
             std::string string;
         };
@@ -261,545 +260,507 @@ namespace xlsxtext
             format_condition condition;
             std::vector<template_part> parts;
         };
-        class number_format_parser
+
+    private:
+        std::string _format_string;
+        std::vector<format_code> _format;
+
+    public:
+        number_format(const std::string &format_string) : _format_string(format_string)
         {
-        private:
-            std::size_t _position = 0;
-            std::string _format_string;
-            std::vector<format_code> _codes;
+            format_code section;
+            template_part part;
 
-        public:
-            number_format_parser(const std::string &format_string) { reset(format_string); }
-            const std::vector<format_code> &result() const { return _codes; }
-            void reset(const std::string &format_string)
+            auto tokens = parse_tokens();
+            for (const auto &token : tokens)
             {
-                _format_string = format_string;
-                _position = 0;
-                _codes.clear();
-            }
-            void parse()
-            {
-                auto token = parse_next_token();
-                format_code section;
-                template_part part;
-
-                for (;;)
+                switch (token.type)
                 {
-                    switch (token.type)
+                case number_format_token::token_type::end_section:
+                {
+                    _format.push_back(section);
+                    section = format_code();
+                    break;
+                }
+                case number_format_token::token_type::color:
+                {
+                    if (section.has_color || section.has_condition || section.has_locale || !section.parts.empty())
                     {
-                    case number_format_token::token_type::end_section:
-                    {
-                        _codes.push_back(section);
-                        section = format_code();
-
-                        break;
+                        throw std::runtime_error(
+                            "color should be the first part of a format");
                     }
 
-                    case number_format_token::token_type::color:
+                    section.has_color = true;
+                    break;
+                }
+                case number_format_token::token_type::locale:
+                {
+                    if (section.has_locale)
                     {
-                        if (section.has_color || section.has_condition || section.has_locale || !section.parts.empty())
-                        {
-                            throw std::runtime_error(
-                                "color should be the first part of a format");
-                        }
-
-                        section.has_color = true;
-                        break;
+                        throw std::runtime_error("multiple locales");
                     }
 
-                    case number_format_token::token_type::locale:
+                    section.has_locale = true;
+
+                    auto hyphen_index = token.string.find('-');
+                    if (hyphen_index == std::string::npos || token.string.front() != '$')
                     {
-                        if (section.has_locale)
-                        {
-                            throw std::runtime_error("multiple locales");
-                        }
-
-                        section.has_locale = true;
-
-                        auto hyphen_index = token.string.find('-');
-                        if (hyphen_index == std::string::npos || token.string.front() != '$')
-                        {
-                            throw std::runtime_error("bad locale: " + token.string);
-                        }
-                        if (hyphen_index > 1)
-                        {
-                            part.type = template_part::template_type::text;
-                            part.string = token.string.substr(1, hyphen_index - 1);
-                            section.parts.push_back(part);
-                            part = template_part();
-                        }
-                        break;
+                        throw std::runtime_error("bad locale: " + token.string);
                     }
-
-                    case number_format_token::token_type::condition:
-                    {
-                        if (section.has_condition)
-                        {
-                            throw std::runtime_error("multiple conditions");
-                        }
-
-                        section.has_condition = true;
-                        std::string value;
-
-                        if (token.string.front() == '<')
-                        {
-                            if (token.string[1] == '=')
-                            {
-                                section.condition.type = format_condition::condition_type::less_or_equal;
-                                value = token.string.substr(2);
-                            }
-                            else if (token.string[1] == '>')
-                            {
-                                section.condition.type = format_condition::condition_type::not_equal;
-                                value = token.string.substr(2);
-                            }
-                            else
-                            {
-                                section.condition.type = format_condition::condition_type::less_than;
-                                value = token.string.substr(1);
-                            }
-                        }
-                        else if (token.string.front() == '>')
-                        {
-                            if (token.string[1] == '=')
-                            {
-                                section.condition.type = format_condition::condition_type::greater_or_equal;
-                                value = token.string.substr(2);
-                            }
-                            else
-                            {
-                                section.condition.type = format_condition::condition_type::greater_than;
-                                value = token.string.substr(1);
-                            }
-                        }
-                        else if (token.string.front() == '=')
-                        {
-                            section.condition.type = format_condition::condition_type::equal;
-                            value = token.string.substr(1);
-                        }
-
-                        section.condition.value = std::stod(value);
-                        break;
-                    }
-
-                    case number_format_token::token_type::text:
+                    if (hyphen_index > 1)
                     {
                         part.type = template_part::template_type::text;
-                        part.string = token.string;
+                        part.string = token.string.substr(1, hyphen_index - 1);
                         section.parts.push_back(part);
                         part = template_part();
-
-                        break;
                     }
-
-                    case number_format_token::token_type::fill:
-                    {
-                        part.type = template_part::template_type::fill;
-                        part.string = token.string;
-                        section.parts.push_back(part);
-                        part = template_part();
-
-                        break;
-                    }
-
-                    case number_format_token::token_type::space:
-                    {
-                        part.type = template_part::template_type::space;
-                        part.string = token.string;
-                        section.parts.push_back(part);
-                        part = template_part();
-
-                        break;
-                    }
-
-                    case number_format_token::token_type::number:
-                    {
-                        part.type = template_part::template_type::general;
-                        part.placeholders = parse_placeholders(token.string);
-                        section.parts.push_back(part);
-                        part = template_part();
-
-                        break;
-                    }
-
-                    case number_format_token::token_type::datetime:
-                    {
-                        section.is_datetime = true;
-
-                        switch (token.string.front())
-                        {
-                        case '[':
-                            section.is_timedelta = true;
-
-                            if (token.string == "[h]" || token.string == "[hh]")
-                            {
-                                part.type = template_part::template_type::elapsed_hours;
-                                break;
-                            }
-                            else if (token.string == "[m]" || token.string == "[mm]")
-                            {
-                                part.type = template_part::template_type::elapsed_minutes;
-                                break;
-                            }
-                            else if (token.string == "[s]" || token.string == "[ss]")
-                            {
-                                part.type = template_part::template_type::elapsed_seconds;
-                                break;
-                            }
-
-                            throw std::runtime_error("unhandled");
-                            break;
-
-                        case 'm':
-                            if (token.string == "m")
-                            {
-                                part.type = template_part::template_type::month_number;
-                                break;
-                            }
-                            else if (token.string == "mm")
-                            {
-                                part.type = template_part::template_type::month_number_leading_zero;
-                                break;
-                            }
-                            else if (token.string == "mmm")
-                            {
-                                part.type = template_part::template_type::month_abbreviation;
-                                break;
-                            }
-                            else if (token.string == "mmmm")
-                            {
-                                part.type = template_part::template_type::month_name;
-                                break;
-                            }
-                            else if (token.string == "mmmmm")
-                            {
-                                part.type = template_part::template_type::month_letter;
-                                break;
-                            }
-
-                            throw std::runtime_error("unhandled");
-                            break;
-
-                        case 'd':
-                            if (token.string == "d")
-                            {
-                                part.type = template_part::template_type::day_number;
-                                break;
-                            }
-                            else if (token.string == "dd")
-                            {
-                                part.type = template_part::template_type::day_number_leading_zero;
-                                break;
-                            }
-                            else if (token.string == "ddd")
-                            {
-                                part.type = template_part::template_type::day_abbreviation;
-                                break;
-                            }
-                            else if (token.string == "dddd")
-                            {
-                                part.type = template_part::template_type::day_name;
-                                break;
-                            }
-
-                            throw std::runtime_error("unhandled");
-                            break;
-
-                        case 'y':
-                            if (token.string == "yy")
-                            {
-                                part.type = template_part::template_type::year_short;
-                                break;
-                            }
-                            else if (token.string == "yyyy")
-                            {
-                                part.type = template_part::template_type::year_long;
-                                break;
-                            }
-
-                            throw std::runtime_error("unhandled");
-                            break;
-
-                        case 'h':
-                            if (token.string == "h")
-                            {
-                                part.type = template_part::template_type::hour;
-                                break;
-                            }
-                            else if (token.string == "hh")
-                            {
-                                part.type = template_part::template_type::hour_leading_zero;
-                                break;
-                            }
-
-                            throw std::runtime_error("unhandled");
-                            break;
-
-                        case 's':
-                            if (token.string == "s")
-                            {
-                                part.type = template_part::template_type::second;
-                                break;
-                            }
-                            else if (token.string == "ss")
-                            {
-                                part.type = template_part::template_type::second_leading_zero;
-                                break;
-                            }
-
-                            throw std::runtime_error("unhandled");
-                            break;
-
-                        case 'A':
-                            section.twelve_hour = true;
-
-                            if (token.string == "AM/PM")
-                            {
-                                part.type = template_part::template_type::am_pm;
-                                break;
-                            }
-                            else if (token.string == "A/P")
-                            {
-                                part.type = template_part::template_type::a_p;
-                                break;
-                            }
-
-                            throw std::runtime_error("unhandled");
-                            break;
-
-                        default:
-                            throw std::runtime_error("unhandled");
-                            break;
-                        }
-
-                        section.parts.push_back(part);
-                        part = template_part();
-
-                        break;
-                    }
-
-                    case number_format_token::token_type::end:
-                    {
-                        _codes.push_back(section);
-                        finalize();
-
-                        return;
-                    }
-                    }
-
-                    token = parse_next_token();
+                    break;
                 }
-            }
-
-        private:
-            void finalize()
-            {
-                for (auto &code : _codes)
+                case number_format_token::token_type::condition:
                 {
-                    bool fix = false;
-                    bool leading_zero = false;
-                    std::size_t minutes_index = 0;
-
-                    bool integer_part = false;
-                    bool fractional_part = false;
-                    std::size_t integer_part_index = 0;
-
-                    bool percentage = false;
-
-                    bool exponent = false;
-                    std::size_t exponent_index = 0;
-
-                    bool fraction = false;
-                    std::size_t fraction_denominator_index = 0;
-                    std::size_t fraction_numerator_index = 0;
-
-                    bool seconds = false;
-                    bool fractional_seconds = false;
-                    std::size_t seconds_index = 0;
-
-                    for (std::size_t i = 0; i < code.parts.size(); ++i)
+                    if (section.has_condition)
                     {
-                        const auto &part = code.parts[i];
-
-                        if (i > 0 && i + 1 < code.parts.size() && part.type == template_part::template_type::text && part.string == "/" && code.parts[i - 1].placeholders.type == format_placeholders::placeholders_type::integer_part && code.parts[i + 1].placeholders.type == format_placeholders::placeholders_type::integer_part)
-                        {
-                            fraction = true;
-                            fraction_numerator_index = i - 1;
-                            fraction_denominator_index = i + 1;
-                        }
-
-                        if (part.placeholders.type == format_placeholders::placeholders_type::integer_part)
-                        {
-                            integer_part = true;
-                            integer_part_index = i;
-                        }
-                        else if (part.placeholders.type == format_placeholders::placeholders_type::fractional_part)
-                        {
-                            fractional_part = true;
-                        }
-                        else if (part.placeholders.type == format_placeholders::placeholders_type::scientific_exponent_plus || part.placeholders.type == format_placeholders::placeholders_type::scientific_exponent_minus)
-                        {
-                            exponent = true;
-                            exponent_index = i;
-                        }
-
-                        if (part.placeholders.percentage)
-                        {
-                            percentage = true;
-                        }
-
-                        if (part.type == template_part::template_type::second || part.type == template_part::template_type::second_leading_zero)
-                        {
-                            seconds = true;
-                            seconds_index = i;
-                        }
-
-                        if (seconds && part.placeholders.type == format_placeholders::placeholders_type::fractional_part)
-                        {
-                            fractional_seconds = true;
-                        }
-
-                        // TODO this block needs improvement
-                        if (part.type == template_part::template_type::month_number || part.type == template_part::template_type::month_number_leading_zero)
-                        {
-                            if (code.parts.size() > 1 && i < code.parts.size() - 2)
-                            {
-                                const auto &next = code.parts[i + 1];
-                                const auto &after_next = code.parts[i + 2];
-
-                                if ((next.type == template_part::template_type::second || next.type == template_part::template_type::second_leading_zero) || (next.type == template_part::template_type::text && next.string == ":" && (after_next.type == template_part::template_type::second || after_next.type == template_part::template_type::second_leading_zero)))
-                                {
-                                    fix = true;
-                                    leading_zero = part.type == template_part::template_type::month_number_leading_zero;
-                                    minutes_index = i;
-                                }
-                            }
-
-                            if (!fix && i > 1)
-                            {
-                                const auto &previous = code.parts[i - 1];
-                                const auto &before_previous = code.parts[i - 2];
-
-                                if (previous.type == template_part::template_type::text && previous.string == ":" && (before_previous.type == template_part::template_type::hour_leading_zero || before_previous.type == template_part::template_type::hour))
-                                {
-                                    fix = true;
-                                    leading_zero = part.type == template_part::template_type::month_number_leading_zero;
-                                    minutes_index = i;
-                                }
-                            }
-                        }
+                        throw std::runtime_error("multiple conditions");
                     }
 
-                    if (fix)
-                    {
-                        code.parts[minutes_index].type = leading_zero ? template_part::template_type::minute_leading_zero
-                                                                      : template_part::template_type::minute;
-                    }
+                    section.has_condition = true;
+                    std::string value;
 
-                    if (integer_part && !fractional_part)
+                    if (token.string.front() == '<')
                     {
-                        code.parts[integer_part_index].placeholders.type = format_placeholders::placeholders_type::integer_only;
-                    }
-
-                    if (integer_part && fractional_part && percentage)
-                    {
-                        code.parts[integer_part_index].placeholders.percentage = true;
-                    }
-
-                    if (exponent)
-                    {
-                        const auto &next = code.parts[exponent_index + 1];
-                        auto temp = code.parts[exponent_index].placeholders.type;
-                        code.parts[exponent_index].placeholders = next.placeholders;
-                        code.parts[exponent_index].placeholders.type = temp;
-                        code.parts.erase(code.parts.begin() + static_cast<std::ptrdiff_t>(exponent_index + 1));
-
-                        for (std::size_t i = 0; i < code.parts.size(); ++i)
+                        if (token.string[1] == '=')
                         {
-                            code.parts[i].placeholders.scientific = true;
+                            section.condition.type = format_condition::condition_type::less_or_equal;
+                            value = token.string.substr(2);
                         }
-                    }
-
-                    if (fraction)
-                    {
-                        code.parts[fraction_numerator_index].placeholders.type = format_placeholders::placeholders_type::fraction_numerator;
-                        code.parts[fraction_denominator_index].placeholders.type = format_placeholders::placeholders_type::fraction_denominator;
-
-                        for (std::size_t i = 0; i < code.parts.size(); ++i)
+                        else if (token.string[1] == '>')
                         {
-                            if (code.parts[i].placeholders.type == format_placeholders::placeholders_type::integer_part)
-                            {
-                                code.parts[i].placeholders.type = format_placeholders::placeholders_type::fraction_integer;
-                            }
-                        }
-                    }
-
-                    if (fractional_seconds)
-                    {
-                        if (code.parts[seconds_index].type == template_part::template_type::second)
-                        {
-                            code.parts[seconds_index].type = template_part::template_type::second_fractional;
+                            section.condition.type = format_condition::condition_type::not_equal;
+                            value = token.string.substr(2);
                         }
                         else
                         {
-                            code.parts[seconds_index].type = template_part::template_type::second_leading_zero_fractional;
+                            section.condition.type = format_condition::condition_type::less_than;
+                            value = token.string.substr(1);
+                        }
+                    }
+                    else if (token.string.front() == '>')
+                    {
+                        if (token.string[1] == '=')
+                        {
+                            section.condition.type = format_condition::condition_type::greater_or_equal;
+                            value = token.string.substr(2);
+                        }
+                        else
+                        {
+                            section.condition.type = format_condition::condition_type::greater_than;
+                            value = token.string.substr(1);
+                        }
+                    }
+                    else if (token.string.front() == '=')
+                    {
+                        section.condition.type = format_condition::condition_type::equal;
+                        value = token.string.substr(1);
+                    }
+
+                    section.condition.value = std::stod(value);
+                    break;
+                }
+                case number_format_token::token_type::text:
+                {
+                    part.type = template_part::template_type::text;
+                    part.string = token.string;
+                    section.parts.push_back(part);
+                    part = template_part();
+
+                    break;
+                }
+                case number_format_token::token_type::fill:
+                {
+                    part.type = template_part::template_type::fill;
+                    part.string = token.string;
+                    section.parts.push_back(part);
+                    part = template_part();
+
+                    break;
+                }
+                case number_format_token::token_type::space:
+                {
+                    part.type = template_part::template_type::space;
+                    part.string = token.string;
+                    section.parts.push_back(part);
+                    part = template_part();
+
+                    break;
+                }
+                case number_format_token::token_type::number:
+                {
+                    part.type = template_part::template_type::general;
+                    part.placeholders = parse_placeholders(token.string);
+                    section.parts.push_back(part);
+                    part = template_part();
+
+                    break;
+                }
+                case number_format_token::token_type::datetime:
+                {
+                    section.is_datetime = true;
+
+                    switch (token.string.front())
+                    {
+                    case '[':
+                        section.is_timedelta = true;
+
+                        if (token.string == "[h]" || token.string == "[hh]")
+                        {
+                            part.type = template_part::template_type::elapsed_hours;
+                            break;
+                        }
+                        else if (token.string == "[m]" || token.string == "[mm]")
+                        {
+                            part.type = template_part::template_type::elapsed_minutes;
+                            break;
+                        }
+                        else if (token.string == "[s]" || token.string == "[ss]")
+                        {
+                            part.type = template_part::template_type::elapsed_seconds;
+                            break;
+                        }
+
+                        throw std::runtime_error("unhandled");
+                        break;
+
+                    case 'm':
+                        if (token.string == "m")
+                        {
+                            part.type = template_part::template_type::month_number;
+                            break;
+                        }
+                        else if (token.string == "mm")
+                        {
+                            part.type = template_part::template_type::month_number_leading_zero;
+                            break;
+                        }
+                        else if (token.string == "mmm")
+                        {
+                            part.type = template_part::template_type::month_abbreviation;
+                            break;
+                        }
+                        else if (token.string == "mmmm")
+                        {
+                            part.type = template_part::template_type::month_name;
+                            break;
+                        }
+                        else if (token.string == "mmmmm")
+                        {
+                            part.type = template_part::template_type::month_letter;
+                            break;
+                        }
+
+                        throw std::runtime_error("unhandled");
+                        break;
+
+                    case 'd':
+                        if (token.string == "d")
+                        {
+                            part.type = template_part::template_type::day_number;
+                            break;
+                        }
+                        else if (token.string == "dd")
+                        {
+                            part.type = template_part::template_type::day_number_leading_zero;
+                            break;
+                        }
+                        else if (token.string == "ddd")
+                        {
+                            part.type = template_part::template_type::day_abbreviation;
+                            break;
+                        }
+                        else if (token.string == "dddd")
+                        {
+                            part.type = template_part::template_type::day_name;
+                            break;
+                        }
+
+                        throw std::runtime_error("unhandled");
+                        break;
+
+                    case 'y':
+                        if (token.string == "yy")
+                        {
+                            part.type = template_part::template_type::year_short;
+                            break;
+                        }
+                        else if (token.string == "yyyy")
+                        {
+                            part.type = template_part::template_type::year_long;
+                            break;
+                        }
+
+                        throw std::runtime_error("unhandled");
+                        break;
+
+                    case 'h':
+                        if (token.string == "h")
+                        {
+                            part.type = template_part::template_type::hour;
+                            break;
+                        }
+                        else if (token.string == "hh")
+                        {
+                            part.type = template_part::template_type::hour_leading_zero;
+                            break;
+                        }
+
+                        throw std::runtime_error("unhandled");
+                        break;
+
+                    case 's':
+                        if (token.string == "s")
+                        {
+                            part.type = template_part::template_type::second;
+                            break;
+                        }
+                        else if (token.string == "ss")
+                        {
+                            part.type = template_part::template_type::second_leading_zero;
+                            break;
+                        }
+
+                        throw std::runtime_error("unhandled");
+                        break;
+
+                    case 'A':
+                        section.twelve_hour = true;
+
+                        if (token.string == "AM/PM")
+                        {
+                            part.type = template_part::template_type::am_pm;
+                            break;
+                        }
+                        else if (token.string == "A/P")
+                        {
+                            part.type = template_part::template_type::a_p;
+                            break;
+                        }
+
+                        throw std::runtime_error("unhandled");
+                        break;
+
+                    default:
+                        throw std::runtime_error("unhandled");
+                        break;
+                    }
+
+                    section.parts.push_back(part);
+                    part = template_part();
+
+                    break;
+                }
+                }
+            }
+            parse_finalize();
+        }
+        void parse_finalize()
+        {
+            for (auto &code : _format)
+            {
+                bool fix = false;
+                bool leading_zero = false;
+                std::size_t minutes_index = 0;
+
+                bool integer_part = false;
+                bool fractional_part = false;
+                std::size_t integer_part_index = 0;
+
+                bool percentage = false;
+
+                bool exponent = false;
+                std::size_t exponent_index = 0;
+
+                bool fraction = false;
+                std::size_t fraction_denominator_index = 0;
+                std::size_t fraction_numerator_index = 0;
+
+                bool seconds = false;
+                bool fractional_seconds = false;
+                std::size_t seconds_index = 0;
+
+                for (std::size_t i = 0; i < code.parts.size(); ++i)
+                {
+                    const auto &part = code.parts[i];
+
+                    if (i > 0 && i + 1 < code.parts.size() && part.type == template_part::template_type::text && part.string == "/" && code.parts[i - 1].placeholders.type == format_placeholders::placeholders_type::integer_part && code.parts[i + 1].placeholders.type == format_placeholders::placeholders_type::integer_part)
+                    {
+                        fraction = true;
+                        fraction_numerator_index = i - 1;
+                        fraction_denominator_index = i + 1;
+                    }
+
+                    if (part.placeholders.type == format_placeholders::placeholders_type::integer_part)
+                    {
+                        integer_part = true;
+                        integer_part_index = i;
+                    }
+                    else if (part.placeholders.type == format_placeholders::placeholders_type::fractional_part)
+                    {
+                        fractional_part = true;
+                    }
+                    else if (part.placeholders.type == format_placeholders::placeholders_type::scientific_exponent_plus || part.placeholders.type == format_placeholders::placeholders_type::scientific_exponent_minus)
+                    {
+                        exponent = true;
+                        exponent_index = i;
+                    }
+
+                    if (part.placeholders.percentage)
+                    {
+                        percentage = true;
+                    }
+
+                    if (part.type == template_part::template_type::second || part.type == template_part::template_type::second_leading_zero)
+                    {
+                        seconds = true;
+                        seconds_index = i;
+                    }
+
+                    if (seconds && part.placeholders.type == format_placeholders::placeholders_type::fractional_part)
+                    {
+                        fractional_seconds = true;
+                    }
+
+                    // TODO this block needs improvement
+                    if (part.type == template_part::template_type::month_number || part.type == template_part::template_type::month_number_leading_zero)
+                    {
+                        if (code.parts.size() > 1 && i < code.parts.size() - 2)
+                        {
+                            const auto &next = code.parts[i + 1];
+                            const auto &after_next = code.parts[i + 2];
+
+                            if ((next.type == template_part::template_type::second || next.type == template_part::template_type::second_leading_zero) || (next.type == template_part::template_type::text && next.string == ":" && (after_next.type == template_part::template_type::second || after_next.type == template_part::template_type::second_leading_zero)))
+                            {
+                                fix = true;
+                                leading_zero = part.type == template_part::template_type::month_number_leading_zero;
+                                minutes_index = i;
+                            }
+                        }
+
+                        if (!fix && i > 1)
+                        {
+                            const auto &previous = code.parts[i - 1];
+                            const auto &before_previous = code.parts[i - 2];
+
+                            if (previous.type == template_part::template_type::text && previous.string == ":" && (before_previous.type == template_part::template_type::hour_leading_zero || before_previous.type == template_part::template_type::hour))
+                            {
+                                fix = true;
+                                leading_zero = part.type == template_part::template_type::month_number_leading_zero;
+                                minutes_index = i;
+                            }
                         }
                     }
                 }
 
-                validate();
-            }
-            void validate()
-            {
-                if (_codes.size() > 4)
+                if (fix)
                 {
-                    throw std::runtime_error("too many format codes");
+                    code.parts[minutes_index].type = leading_zero ? template_part::template_type::minute_leading_zero
+                                                                  : template_part::template_type::minute;
                 }
 
-                if (_codes.size() > 2)
+                if (integer_part && !fractional_part)
                 {
-                    if (_codes[0].has_condition && _codes[1].has_condition && _codes[2].has_condition)
+                    code.parts[integer_part_index].placeholders.type = format_placeholders::placeholders_type::integer_only;
+                }
+
+                if (integer_part && fractional_part && percentage)
+                {
+                    code.parts[integer_part_index].placeholders.percentage = true;
+                }
+
+                if (exponent)
+                {
+                    const auto &next = code.parts[exponent_index + 1];
+                    auto temp = code.parts[exponent_index].placeholders.type;
+                    code.parts[exponent_index].placeholders = next.placeholders;
+                    code.parts[exponent_index].placeholders.type = temp;
+                    code.parts.erase(code.parts.begin() + static_cast<std::ptrdiff_t>(exponent_index + 1));
+
+                    for (std::size_t i = 0; i < code.parts.size(); ++i)
                     {
-                        throw std::runtime_error(
-                            "format should have a maximum of two codes with conditions");
+                        code.parts[i].placeholders.scientific = true;
+                    }
+                }
+
+                if (fraction)
+                {
+                    code.parts[fraction_numerator_index].placeholders.type = format_placeholders::placeholders_type::fraction_numerator;
+                    code.parts[fraction_denominator_index].placeholders.type = format_placeholders::placeholders_type::fraction_denominator;
+
+                    for (std::size_t i = 0; i < code.parts.size(); ++i)
+                    {
+                        if (code.parts[i].placeholders.type == format_placeholders::placeholders_type::integer_part)
+                        {
+                            code.parts[i].placeholders.type = format_placeholders::placeholders_type::fraction_integer;
+                        }
+                    }
+                }
+
+                if (fractional_seconds)
+                {
+                    if (code.parts[seconds_index].type == template_part::template_type::second)
+                    {
+                        code.parts[seconds_index].type = template_part::template_type::second_fractional;
+                    }
+                    else
+                    {
+                        code.parts[seconds_index].type = template_part::template_type::second_leading_zero_fractional;
                     }
                 }
             }
 
-            number_format_token parse_next_token()
+            if (_format.size() > 4)
+            {
+                throw std::runtime_error("too many format codes");
+            }
+
+            if (_format.size() > 2)
+            {
+                if (_format[0].has_condition && _format[1].has_condition && _format[2].has_condition)
+                {
+                    throw std::runtime_error(
+                        "format should have a maximum of two codes with conditions");
+                }
+            }
+        }
+
+        std::vector<number_format_token> parse_tokens() const
+        {
+            auto to_lower = [](char c)
+            {
+                return static_cast<char>(std::tolower(static_cast<std::uint8_t>(c)));
+            };
+
+            std::vector<number_format_token> tokens;
+            std::string::size_type position = 0;
+            while (position < _format_string.size())
             {
                 number_format_token token;
-
-                auto to_lower = [](char c)
-                {
-                    return static_cast<char>(std::tolower(static_cast<std::uint8_t>(c)));
-                };
-
-                if (_format_string.size() <= _position)
-                {
-                    token.type = number_format_token::token_type::end;
-                    return token;
-                }
-
-                auto current_char = _format_string[_position++];
-
+                auto current_char = _format_string[position++];
                 switch (current_char)
                 {
                 case '[':
-                    if (_position == _format_string.size())
+                    if (position == _format_string.size())
                     {
                         throw std::runtime_error("missing ]");
                     }
 
-                    if (_format_string[_position] == ']')
+                    if (_format_string[position] == ']')
                     {
                         throw std::runtime_error("empty []");
                     }
 
                     do
                     {
-                        token.string.push_back(_format_string[_position++]);
-                    } while (_position < _format_string.size() && _format_string[_position] != ']');
+                        token.string.push_back(_format_string[position++]);
+                    } while (position < _format_string.size() && _format_string[position] != ']');
 
                     if (token.string[0] == '<' || token.string[0] == '>' || token.string[0] == '=')
                     {
@@ -819,37 +780,37 @@ namespace xlsxtext
                         token.type = number_format_token::token_type::color;
                     }
 
-                    ++_position;
+                    ++position;
 
                     break;
 
                 case '\\':
                     token.type = number_format_token::token_type::text;
-                    token.string.push_back(_format_string[_position++]);
+                    token.string.push_back(_format_string[position++]);
 
                     break;
 
                 case 'G':
-                    if (_format_string.substr(_position - 1, 7) != "General")
+                    if (_format_string.substr(position - 1, 7) != "General")
                     {
                         throw std::runtime_error("expected General");
                     }
 
                     token.type = number_format_token::token_type::number;
                     token.string = "General";
-                    _position += 6;
+                    position += 6;
 
                     break;
 
                 case '_':
                     token.type = number_format_token::token_type::space;
-                    token.string.push_back(_format_string[_position++]);
+                    token.string.push_back(_format_string[position++]);
 
                     break;
 
                 case '*':
                     token.type = number_format_token::token_type::fill;
-                    token.string.push_back(_format_string[_position++]);
+                    token.string.push_back(_format_string[position++]);
 
                     break;
 
@@ -862,15 +823,15 @@ namespace xlsxtext
                     do
                     {
                         token.string.push_back(current_char);
-                        current_char = _format_string[_position++];
+                        current_char = _format_string[position++];
                     } while (current_char == '0' || current_char == '#' || current_char == '?' || current_char == ',');
 
-                    --_position;
+                    --position;
 
                     if (current_char == '%')
                     {
                         token.string.push_back('%');
-                        ++_position;
+                        ++position;
                     }
 
                     break;
@@ -888,10 +849,10 @@ namespace xlsxtext
                     token.type = number_format_token::token_type::datetime;
                     token.string.push_back(to_lower(current_char));
 
-                    while (_format_string[_position] == current_char)
+                    while (_format_string[position] == current_char)
                     {
                         token.string.push_back(to_lower(current_char));
-                        ++_position;
+                        ++position;
                     }
 
                     break;
@@ -899,14 +860,14 @@ namespace xlsxtext
                 case 'A':
                     token.type = number_format_token::token_type::datetime;
 
-                    if (_format_string.substr(_position - 1, 5) == "AM/PM")
+                    if (_format_string.substr(position - 1, 5) == "AM/PM")
                     {
-                        _position += 4;
+                        position += 4;
                         token.string = "AM/PM";
                     }
-                    else if (_format_string.substr(_position - 1, 3) == "A/P")
+                    else if (_format_string.substr(position - 1, 3) == "A/P")
                     {
-                        _position += 2;
+                        position += 2;
                         token.string = "A/P";
                     }
                     else
@@ -919,16 +880,16 @@ namespace xlsxtext
                 case '"':
                 {
                     token.type = number_format_token::token_type::text;
-                    auto start = _position;
-                    auto end = _format_string.find('"', _position);
+                    auto start = position;
+                    auto end = _format_string.find('"', position);
 
                     while (end != std::string::npos && _format_string[end - 1] == '\\')
                     {
                         token.string.append(_format_string.substr(start, end - start - 1));
                         token.string.push_back('"');
-                        _position = end + 1;
-                        start = _position;
-                        end = _format_string.find('"', _position);
+                        position = end + 1;
+                        start = position;
+                        end = _format_string.find('"', position);
                     }
 
                     if (end != start)
@@ -936,7 +897,7 @@ namespace xlsxtext
                         token.string.append(_format_string.substr(start, end - start));
                     }
 
-                    _position = end + 1;
+                    position = end + 1;
 
                     break;
                 }
@@ -995,7 +956,7 @@ namespace xlsxtext
                 case 'E':
                     token.type = number_format_token::token_type::number;
                     token.string.push_back(current_char);
-                    current_char = _format_string[_position++];
+                    current_char = _format_string[position++];
 
                     if (current_char == '+' || current_char == '-')
                     {
@@ -1008,94 +969,91 @@ namespace xlsxtext
                 default:
                     throw std::runtime_error("unexpected character");
                 }
-
-                return token;
+                tokens.push_back(token);
             }
-            format_placeholders parse_placeholders(const std::string &placeholders_string)
+            if (tokens.size() > 0 && tokens[tokens.size() - 1].type != number_format_token::token_type::end_section)
             {
-                format_placeholders p;
+                number_format_token token;
+                token.type = number_format_token::token_type::end_section;
+                tokens.push_back(token);
+            }
 
-                if (placeholders_string == "General")
-                {
-                    p.type = format_placeholders::placeholders_type::general;
-                    return p;
-                }
-                else if (placeholders_string == "@")
-                {
-                    p.type = format_placeholders::placeholders_type::text;
-                    return p;
-                }
-                else if (placeholders_string.front() == '.')
-                {
-                    p.type = format_placeholders::placeholders_type::fractional_part;
-                }
-                else if (placeholders_string.front() == 'E')
-                {
-                    p.type = placeholders_string[1] == '+' ? format_placeholders::placeholders_type::scientific_exponent_plus : format_placeholders::placeholders_type::scientific_exponent_minus;
-                    return p;
-                }
-                else
-                {
-                    p.type = format_placeholders::placeholders_type::integer_part;
-                }
+            return tokens;
+        }
+        format_placeholders parse_placeholders(const std::string &placeholders_string) const
+        {
+            format_placeholders p;
 
-                if (placeholders_string.back() == '%')
-                {
-                    p.percentage = true;
-                }
-
-                std::vector<std::size_t> comma_indices;
-
-                for (std::size_t i = 0; i < placeholders_string.size(); ++i)
-                {
-                    auto c = placeholders_string[i];
-
-                    if (c == '0')
-                    {
-                        ++p.num_zeros;
-                    }
-                    else if (c == '#')
-                    {
-                        ++p.num_optionals;
-                    }
-                    else if (c == '?')
-                    {
-                        ++p.num_spaces;
-                    }
-                    else if (c == ',')
-                    {
-                        comma_indices.push_back(i);
-                    }
-                }
-
-                if (!comma_indices.empty())
-                {
-                    std::size_t i = placeholders_string.size() - 1;
-
-                    while (!comma_indices.empty() && i == comma_indices.back())
-                    {
-                        ++p.thousands_scale;
-                        --i;
-                        comma_indices.pop_back();
-                    }
-
-                    p.use_comma_separator = !comma_indices.empty();
-                }
-
+            if (placeholders_string == "General")
+            {
+                p.type = format_placeholders::placeholders_type::general;
                 return p;
             }
-        };
+            else if (placeholders_string == "@")
+            {
+                p.type = format_placeholders::placeholders_type::text;
+                return p;
+            }
+            else if (placeholders_string.front() == '.')
+            {
+                p.type = format_placeholders::placeholders_type::fractional_part;
+            }
+            else if (placeholders_string.front() == 'E')
+            {
+                p.type = placeholders_string[1] == '+' ? format_placeholders::placeholders_type::scientific_exponent_plus : format_placeholders::placeholders_type::scientific_exponent_minus;
+                return p;
+            }
+            else
+            {
+                p.type = format_placeholders::placeholders_type::integer_part;
+            }
 
-    private:
-        number_format_parser _parser;
-        std::vector<format_code> _format;
+            if (placeholders_string.back() == '%')
+            {
+                p.percentage = true;
+            }
 
-    public:
-        number_format(const std::string &format_string) : _parser(format_string)
-        {
-            _parser.parse();
-            _format = _parser.result();
+            std::vector<std::size_t> comma_indices;
+
+            for (std::size_t i = 0; i < placeholders_string.size(); ++i)
+            {
+                auto c = placeholders_string[i];
+
+                if (c == '0')
+                {
+                    ++p.num_zeros;
+                }
+                else if (c == '#')
+                {
+                    ++p.num_optionals;
+                }
+                else if (c == '?')
+                {
+                    ++p.num_spaces;
+                }
+                else if (c == ',')
+                {
+                    comma_indices.push_back(i);
+                }
+            }
+
+            if (!comma_indices.empty())
+            {
+                std::size_t i = placeholders_string.size() - 1;
+
+                while (!comma_indices.empty() && i == comma_indices.back())
+                {
+                    ++p.thousands_scale;
+                    --i;
+                    comma_indices.pop_back();
+                }
+
+                p.use_comma_separator = !comma_indices.empty();
+            }
+
+            return p;
         }
+
         std::string format(double number, bool is_date1904 = false)
         {
             if (_format[0].has_condition)
