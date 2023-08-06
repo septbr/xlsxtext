@@ -1824,7 +1824,14 @@ namespace xlsxtext
                 auto index = std::stol(s);
                 auto xf = index < _package->cell_xfs.size() ? _package->cell_xfs[index] : 0;
                 const auto &format = _package->numfmts.find(xf) != _package->numfmts.end() ? _package->numfmts[xf] : "";
-                return _package->format(format, v);
+
+                char *end = nullptr;
+                const char *str = v.c_str();
+                auto number = std::strtod(str, &end);
+                if (end != str && *end == '\0')
+                    return _package->format(format, number);
+                else
+                    return _package->format(format, v);
             }
             return "";
         }
