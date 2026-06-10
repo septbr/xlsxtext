@@ -420,34 +420,6 @@ int main()
 #endif
 
     test_number_format();
-    clock_t start = clock();
-    xlsxtext::workbook workbook("../../doc/zip.xlsx");
-    workbook.read();
-    for (auto worksheet : workbook)
-    {
-        std::cout << worksheet.name() << std::endl;
-        try
-        {
-            auto errors = worksheet.read();
-            for (auto kv : errors)
-                std::cerr << kv.first << ": " << kv.second << std::endl;
-
-            std::cout << std::endl;
-            for (auto row : worksheet)
-            {
-                for (auto cell : row)
-                {
-                    std::cout << cell.refer.value() << ": " << cell.value << std::endl;
-                }
-                std::cout << std::endl;
-            }
-        }
-        catch (std::string err)
-        {
-            std::cout << err << std::endl;
-        }
-    }
-    std::cout << clock() - start << std::endl;
 
 #ifdef _WIN32
     SetConsoleOutputCP(__ConOutCP);
