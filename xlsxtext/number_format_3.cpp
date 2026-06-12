@@ -1,9 +1,13 @@
 // =============================================================================
-// number_format_3.cpp — all implementation hidden behind Pimpl
+// number_format_3.cpp — Excel number format string parser & formatter
 //
-// Anonymous namespace: constants, date helpers, formatting helpers
-// number_format::impl:  all nested types, data, parsing & formatting logic
-// number_format public: thin wrappers delegating to _impl
+// Implements ECMA-376 Part 1 §18.8.31 (numFmt / formatCode) semantics.
+// Reference: ISO/IEC 29500-1:2016 (Office Open XML File Formats)
+//
+// Architecture:
+//   anonymous namespace — pure math/date helpers, no dependency on impl
+//   number_format::impl   — all parsing, analysis, and formatting logic
+//   number_format public  — Pimpl wrappers (thin delegation)
 // =============================================================================
 
 #include "number_format_3.hpp"
@@ -12,7 +16,6 @@
 #include <charconv>
 #include <cmath>
 #include <cstdint>
-#include <cstdlib>
 #include <stdexcept>
 #include <vector>
 
@@ -20,19 +23,33 @@ namespace xlsxtext
 {
 
 // =============================================================================
-// Anonymous namespace — pure helpers, no dependency on number_format internals
+// Anonymous namespace — pure helpers
 // =============================================================================
 
 namespace
 {
 
+    // Floating-point comparison tolerance
     constexpr double float_epsilon = 1e-10;
+
+    // Default Excel column width in characters (for overflow display: "####...")
     constexpr std::size_t default_cell_width = 11;
 
+    // Precomputed powers of 10 for fast lookup (indices 0..15)
     constexpr std::array<double, 16> pow10 = {
         1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7,
         1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15
     };
+
+    // Safe power-of-10 lookup with fallback to std::pow for large exponents
+    inline double pow10_safe(int n) noexcept
+    {
+        if (n >= 0 && n < static_cast<int>(pow10.size()))
+            return pow10[static_cast<size_t>(n)];
+        return std::pow(10.0, static_cast<double>(n));
+    }
+
+    // ---- date/time name tables ----
 
     constexpr std::array<const char*, 12> month_names = {
         "January", "February", "March", "April", "May", "June",
@@ -49,19 +66,14 @@ namespace
         "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"
     };
 
+    // Decomposed date/time components
     struct date_parts
     {
-        int year, month, day, hour, minute, second, dow;
-        double fsec;
+        int year, month, day, hour, minute, second, dow; // dow = day-of-week (0=Sun)
+        double fsec; // fractional seconds
     };
 
-    // ---- integer-to-chars helpers (zero heap allocation) ----
-
-    int int_to_chars(char* buf, int val) noexcept
-    {
-        auto r = std::to_chars(buf, buf + 16, val);
-        return static_cast<int>(r.ptr - buf);
-    }
+    // ---- fast integer-to-string (no heap allocation) ----
 
     void append_int(std::string& out, int val) noexcept
     {
@@ -78,17 +90,32 @@ namespace
         out.append(buf, r.ptr);
     }
 
+    // Append val with leading zeros to fill at least `width` characters.
+    // For negative values, no padding is applied (minimal guard).
     void append_pad4(std::string& out, int val) noexcept
     {
-        if (val < 1000) out += '0';
-        if (val < 100)  out += '0';
-        if (val < 10)   out += '0';
-        char buf[8];
-        auto r = std::to_chars(buf, buf + 8, val);
+        if (val >= 0)
+        {
+            if (val < 1000) out += '0';
+            if (val < 100)  out += '0';
+            if (val < 10)   out += '0';
+        }
+        char buf[16];
+        auto r = std::to_chars(buf, buf + 16, val);
         out.append(buf, r.ptr);
     }
 
-    // ---- date/time helpers ----
+    // Append val with leading zeros to fill at least `width` characters.
+    void append_padded(std::string& out, int val, int width) noexcept
+    {
+        char buf[16];
+        auto r = std::to_chars(buf, buf + sizeof(buf), val);
+        const int len = static_cast<int>(r.ptr - buf);
+        for (int k = len; k < width; ++k) out += '0';
+        out.append(buf, static_cast<size_t>(len));
+    }
+
+    // ---- date/time arithmetic (Howard Hinnant's civil calendar algorithms) ----
 
     int compute_gcd(int a, int b) noexcept
     {
@@ -96,6 +123,7 @@ namespace
         return a;
     }
 
+    // Convert civil date (y,m,d) to serial day number (days since 1970-01-01)
     int days_from_civil(int y, int m, int d) noexcept
     {
         y -= m <= 2;
@@ -106,6 +134,7 @@ namespace
         return era * 146097 + doe - 719468;
     }
 
+    // Convert serial day number back to civil date (y,m,d)
     void civil_from_days(int z, int& y, int& m, int& d) noexcept
     {
         z += 719468;
@@ -120,11 +149,15 @@ namespace
         y += (m <= 2);
     }
 
+    // Convert Excel serial date number to date_parts.
+    // Handles the 1900 leap-year bug (serial 60 = Feb 29, 1900).
+    // Supports both 1900 and 1904 date systems.
     date_parts serial_to_date(double serial, bool date1904) noexcept
     {
         const int whole = static_cast<int>(std::floor(serial));
         const double frac = serial - whole;
 
+        // ECMA-376: 1900 date system treats serial 60 as 1900-02-29 (leap year bug)
         if (!date1904 && whole == 60)
         {
             const int dow = (whole + 6) % 7;
@@ -137,17 +170,19 @@ namespace
             return {1900, 2, 29, hour, minute, second, dow, fsec};
         }
 
+        // 1900 system: days 1..60 have an off-by-one (nonexistent Feb 29, 1900)
         int real_days = whole;
         if (!date1904 && real_days > 60)
             --real_days;
 
         const int epoch_days = date1904
-            ? days_from_civil(1904, 1, 1)
-            : days_from_civil(1899, 12, 31);
+            ? days_from_civil(1904, 1, 1)   // 1904 epoch
+            : days_from_civil(1899, 12, 31); // 1900 epoch (day 1 = 1900-01-01)
 
         int y, m, d;
         civil_from_days(epoch_days + real_days, y, m, d);
 
+        // dow = (serial + 6) mod 7: Excel 1900 epoch (1899-12-31) is Sunday (dow=0)
         const int dow = (whole + 6) % 7;
         const double total_seconds = frac * 86400.0;
         const int hour = static_cast<int>(total_seconds) / 3600;
@@ -159,12 +194,16 @@ namespace
         return {y, m, d, hour, minute, second, dow, fsec};
     }
 
+    // Find the best rational approximation of `frac` with denominator ≤ max_den.
+    // Tries common denominators first (powers of 2, 10, common fractions),
+    // then falls back to exhaustive search if no good match found.
     void best_fraction(double frac, int max_den, int& best_num, int& best_den) noexcept
     {
         best_num = 0;
         best_den = 1;
         double best_err = 1.0;
 
+        // Phase 1: try common denominators first (powers of 2, 10, 3, 5, etc.)
         static constexpr int common_denoms[] = {2, 4, 8, 16, 32, 64, 10, 100, 3, 6, 12, 24, 48, 96, 5, 20, 50};
         for (int d : common_denoms)
         {
@@ -175,6 +214,7 @@ namespace
             if (err < best_err - 1e-12) { best_err = err; best_num = n; best_den = d; }
         }
 
+        // Phase 2: exhaustive search if no close match found
         if (best_err > 1e-6)
         {
             for (int d = 1; d <= max_den; ++d)
@@ -186,6 +226,7 @@ namespace
             }
         }
 
+        // Reduce fraction to lowest terms
         if (best_num > 0 && best_den > 1)
         {
             const int g = compute_gcd(best_num, best_den);
@@ -194,6 +235,7 @@ namespace
         if (best_num == best_den) { best_num = 0; best_den = 1; }
     }
 
+    // "General" format: shortest decimal representation via std::to_chars
     std::string format_number_general(double number)
     {
         char buf[64]{};
@@ -209,32 +251,76 @@ namespace
 
 struct number_format::impl
 {
+    // =========================================================================
+    // Token types — ECMA-376 §18.8.31 format code components
+    // =========================================================================
+
     enum class token_type : uint8_t
     {
-        literal,
-        digit_zero, digit_hash, digit_qmark,
-        decimal, thousands, percent, scientific,
-        text_placeholder, skip, fill,
-        year_2, year_4,
-        month_n, month_nn, month_mmm, month_mmmm, month_mmmmm,
-        day_d, day_dd, day_ddd, day_dddd,
-        hour_h, hour_hh,
-        minute_m, minute_mm,
-        second_s, second_ss,
-        am_pm,
-        elapsed_hours, elapsed_minutes, elapsed_seconds,
-        frac_second,
+        // ---- structural ----
+        literal,          // literal text, quoted strings, escaped chars
+        text_placeholder, // @ — replaced with the raw cell text
+        skip,             // _x — skip the width of the next character
+        fill,             // *x — repeat the next character to fill the cell
+
+        // ---- number placeholders (§18.8.31) ----
+        digit_zero,       // 0 — always show digit, pad with leading/trailing zeros
+        digit_hash,       // # — show significant digit only, suppress insignificant
+        digit_qmark,      // ? — like # but pad with spaces for alignment
+        decimal,           // . — decimal point position
+        thousands,         // , — thousands separator (or scale divider)
+        percent,           // % — multiply by 100, show percent sign
+        scientific,        // E+/E- — scientific notation exponent marker
+
+        // ---- date placeholders (§18.17.4.1) ----
+        year_2,           // yy
+        year_4,           // yyyy+
+        month_n,          // m
+        month_nn,         // mm
+        month_mmm,        // mmm — abbreviated month name
+        month_mmmm,       // mmmm — full month name
+        month_mmmmm,      // mmmmm+ — first letter of month
+        day_d,            // d
+        day_dd,           // dd
+        day_ddd,          // ddd — abbreviated day name
+        day_dddd,         // dddd+ — full day name
+
+        // ---- time placeholders (§18.17.4.1) ----
+        hour_h,           // h
+        hour_hh,          // hh
+        minute_m,         // m (resolved from m/mm ambiguity)
+        minute_mm,        // mm (resolved from m/mm ambiguity)
+        second_s,         // s
+        second_ss,        // ss
+        am_pm,            // AM/PM or A/P
+        frac_second,      // .0, .00, .000 — fractional seconds
+
+        // ---- elapsed time (§18.8.31) ----
+        elapsed_hours,    // [h], [hh], [hhh], ...
+        elapsed_minutes,  // [m], [mm], ...
+        elapsed_seconds,  // [s], [ss], ...
     };
 
+    // A parsed token — the basic unit after flattening
     struct token
     {
         token_type type = token_type::literal;
-        std::string literal;
-        int repeat = 0;
-        bool exp_plus_sign = true;
-        int exp_digits = 0;
+        std::string literal;    // literal text content (for literal, skip, fill, am_pm)
+        int repeat = 0;         // repeat count (for digit placeholders, frac_second, elapsed time)
+        bool exp_plus_sign = true;  // E+ vs E- (for scientific)
+        int exp_digits = 0;     // number of exponent digits (for scientific)
     };
 
+    // Intermediate token during parsing — may carry repeat count before flattening
+    struct raw_token
+    {
+        token_type type;
+        int repeat;
+        std::string lit;
+    };
+
+    // A format section — divided by ';' in the format string.
+    // Up to 4 sections: [positive]; [negative]; [zero]; [text]
     struct section
     {
         std::vector<token> tokens;
@@ -242,12 +328,13 @@ struct number_format::impl
         enum cond_op : uint8_t { cond_none, cond_gt, cond_ge, cond_lt, cond_le, cond_eq, cond_ne };
         cond_op condition_op = cond_none;
         double condition_value = 0;
-        std::string color;
-        std::string locale_currency;
-        int section_type = 0;
-        int scale = 1;
+        std::string color;              // [ColorName] bracket
+        std::string locale_currency;    // [$Currency-Locale] bracket
+        int section_type = 0;           // 0=pos, 1=neg, 2=zero, 3=text
+        int scale = 1;                  // divisor from trailing commas (1, 1000, 1000000, ...)
     };
 
+    // Summary of what a section contains (for dispatching to the right formatter)
     struct section_info
     {
         bool has_digits = false;
@@ -258,13 +345,41 @@ struct number_format::impl
         bool has_ampm = false;
     };
 
+    // Counts of digit placeholders (0, #, ?) on each side of the decimal point
+    struct digit_counts
+    {
+        int int_zeros = 0, int_hashes = 0, int_qmarks = 0;
+        int frac_zeros = 0, frac_hashes = 0, frac_qmarks = 0;
+        int thousands = 0;
+        int total_frac() const noexcept { return frac_zeros + frac_hashes + frac_qmarks; }
+    };
+
+    // Fraction format layout: positions of digit groups around the '/' separator
+    struct fraction_layout
+    {
+        int slash_pos = -1;     // position of '/' token
+        int space_pos = -1;     // position of space separator (indicates integer part exists)
+        int int_digits = 0;     // count of integer-placeholder tokens
+        int num_digits = 0;     // count of numerator-placeholder tokens
+        int den_digits = 0;     // count of denominator-placeholder tokens
+        int num_qmarks = 0;     // count of ? tokens in numerator (for space padding)
+        int den_qmarks = 0;     // count of ? tokens in denominator (for space padding)
+    };
+
     // ---- data ----
 
     std::vector<section> sections;
-    bool is_general = false;
-    int text_section_idx = -1;
+    bool is_general = false;       // Format is "General" (no formatting)
+    int text_section_idx = -1;     // Index of the 4th (text) section, or -1
 
-    // ---- token predicates ----
+    // =========================================================================
+    // Token type predicates
+    // =========================================================================
+
+    static bool is_digit_token(token_type t) noexcept
+    {
+        return t == token_type::digit_zero || t == token_type::digit_hash || t == token_type::digit_qmark;
+    }
 
     static bool is_date_token(token_type t) noexcept
     {
@@ -297,84 +412,30 @@ struct number_format::impl
         }
     }
 
-    // ---- section selection ----
-
-    const section* select_section(double number) const noexcept
-    {
-        if (sections.empty()) return nullptr;
-
-        bool any_condition = false;
-        for (auto& sec : sections)
-            if (sec.has_condition) { any_condition = true; break; }
-
-        for (auto& sec : sections)
-        {
-            if (!sec.has_condition) continue;
-            bool match = false;
-            switch (sec.condition_op)
-            {
-            case section::cond_gt: match = number > sec.condition_value + float_epsilon; break;
-            case section::cond_ge: match = number >= sec.condition_value - float_epsilon; break;
-            case section::cond_lt: match = number < sec.condition_value - float_epsilon; break;
-            case section::cond_le: match = number <= sec.condition_value + float_epsilon; break;
-            case section::cond_eq: match = std::fabs(number - sec.condition_value) < float_epsilon; break;
-            case section::cond_ne: match = std::fabs(number - sec.condition_value) >= float_epsilon; break;
-            default: break;
-            }
-            if (match) return &sec;
-        }
-
-        if (any_condition)
-            for (auto& sec : sections)
-                if (!sec.has_condition) return &sec;
-
-        const size_t n = sections.size();
-        if (n == 1)       return &sections[0];
-        else if (n == 2)  return (number < 0) ? &sections[1] : &sections[0];
-        else              return number > 0 ? &sections[0] : number < 0 ? &sections[1] : &sections[2];
-    }
-
-    // ---- section analysis ----
-
-    static section_info analyze_section(const section& sec) noexcept
-    {
-        section_info info;
-        for (size_t i = 0; i < sec.tokens.size(); ++i)
-        {
-            const auto tt = sec.tokens[i].type;
-            switch (tt)
-            {
-            case token_type::digit_zero: case token_type::digit_hash:
-            case token_type::digit_qmark:
-                info.has_digits = true;
-                if (!info.is_fraction && i > 0 &&
-                    sec.tokens[i - 1].type == token_type::literal &&
-                    sec.tokens[i - 1].literal == "/")
-                {
-                    for (int j = static_cast<int>(i) - 2; j >= 0; --j)
-                    {
-                        const auto pt = sec.tokens[static_cast<size_t>(j)].type;
-                        if (pt == token_type::digit_zero || pt == token_type::digit_hash || pt == token_type::digit_qmark)
-                        { info.is_fraction = true; break; }
-                        if (pt == token_type::literal && sec.tokens[static_cast<size_t>(j)].literal == " ")
-                            break;
-                        break;
-                    }
-                }
-                break;
-            case token_type::percent:  info.has_percent = true; break;
-            case token_type::scientific: info.has_scientific = true; break;
-            case token_type::am_pm:    info.has_ampm = true; break;
-            default:
-                if (is_date_token(tt) || is_time_token(tt))
-                    info.has_date_time = true;
-                break;
-            }
-        }
-        return info;
-    }
-
-    // ---- parse ----
+    // =========================================================================
+    // Parse — ECMA-376 §18.8.31 format code grammar
+    //
+    // Format string structure:
+    //   [condition] [color] [$-locale] format-body
+    //
+    // Format body token types:
+    //   "text"   — literal (quoted)
+    //   \c       — escaped character
+    //   _c       — skip width of character c
+    //   *c       — fill with character c
+    //   @        — text placeholder
+    //   0 # ?    — digit placeholders
+    //   .        — decimal point
+    //   ,        — thousands separator (or scale if after last digit)
+    //   %        — percent
+    //   E+ E-    — scientific notation
+    //   y m d h s — date/time components
+    //   AM/PM A/P — 12-hour clock indicator
+    //   [h] [m] [s] [hh] [mm] [ss] — elapsed time
+    //   /        — fraction separator
+    //   :        — time separator
+    //   () - + space — literal characters
+    // =========================================================================
 
     void parse(const std::string& fmt)
     {
@@ -384,313 +445,23 @@ struct number_format::impl
 
         if (fmt.empty()) { is_general = true; return; }
 
-        std::string upper;
-        upper.reserve(fmt.size());
-        for (auto c : fmt)
-            upper += static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-        if (upper == "GENERAL") { is_general = true; return; }
-
-        // Split into sections by ';'
-        std::vector<std::string> raw_sections;
-        std::string cur;
-        bool in_quote = false, in_bracket = false;
-
-        for (size_t i = 0; i < fmt.size(); ++i)
+        // ECMA-376: "General" means no formatting
         {
-            const char c = fmt[i];
-            if (c == '"' && !in_bracket) { in_quote = !in_quote; cur += c; continue; }
-            if (!in_quote && c == '[')   { in_bracket = true; cur += c; continue; }
-            if (!in_quote && c == ']')   { in_bracket = false; cur += c; continue; }
-            if (!in_quote && !in_bracket && c == ';') { raw_sections.push_back(cur); cur.clear(); continue; }
-            if (c == '\\' && i + 1 < fmt.size()) { cur += c; cur += fmt[++i]; continue; }
-            cur += c;
+            std::string upper;
+            upper.reserve(fmt.size());
+            for (auto c : fmt)
+                upper += static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+            if (upper == "GENERAL") { is_general = true; return; }
         }
-        raw_sections.push_back(cur);
 
+        auto raw_sections = split_sections(fmt);
         if (raw_sections.size() > 4)
             throw std::runtime_error("too many format sections (max 4)");
 
-        for (size_t si = 0; si < raw_sections.size(); ++si)
+        int condition_count = 0;
+        for (size_t i = 0; i < raw_sections.size(); ++i)
         {
-            section sec;
-            sec.section_type = static_cast<int>(si);
-            const std::string& raw = raw_sections[si];
-            size_t pos = 0;
-
-            // Parse leading bracket
-            if (pos < raw.size() && raw[pos] == '[')
-            {
-                const size_t end = raw.find(']', pos);
-                if (end != std::string::npos)
-                {
-                    const std::string bracket = raw.substr(pos + 1, end - pos - 1);
-                    const bool is_elapsed = (bracket.size() == 1 &&
-                        (bracket[0] == 'h' || bracket[0] == 'H' ||
-                         bracket[0] == 'm' || bracket[0] == 'M' ||
-                         bracket[0] == 's' || bracket[0] == 'S'));
-                    const bool is_locale = (!bracket.empty() && bracket[0] == '$');
-
-                    if (!is_elapsed && !is_locale)
-                    {
-                        pos = end + 1;
-                        if (!bracket.empty() &&
-                            (bracket[0] == '>' || bracket[0] == '<' || bracket[0] == '='))
-                        {
-                            if (sec.has_condition)
-                                throw std::runtime_error("multiple conditions in one section");
-                            sec.has_condition = true;
-                            const char* p = bracket.c_str();
-                                 if (p[0] == '>' && p[1] == '=') { sec.condition_op = section::cond_ge; p += 2; }
-                            else if (p[0] == '<' && p[1] == '=') { sec.condition_op = section::cond_le; p += 2; }
-                            else if (p[0] == '<' && p[1] == '>') { sec.condition_op = section::cond_ne; p += 2; }
-                            else if (p[0] == '>')                  { sec.condition_op = section::cond_gt; p += 1; }
-                            else if (p[0] == '<')                  { sec.condition_op = section::cond_lt; p += 1; }
-                            else if (p[0] == '=')                  { sec.condition_op = section::cond_eq; p += 1; }
-                            sec.condition_value = std::strtod(p, nullptr);
-                        }
-                        else { sec.color = bracket; }
-                    }
-                    else if (is_locale)
-                    {
-                        auto hyphen = bracket.find('-');
-                        if (hyphen != std::string::npos && hyphen > 1)
-                            sec.locale_currency = bracket.substr(1, hyphen - 1);
-                        pos = end + 1;
-                    }
-                }
-            }
-
-            // Validate condition count
-            {
-                int cond_count = 0;
-                for (auto& s : sections) if (s.has_condition) ++cond_count;
-                if (sec.has_condition) ++cond_count;
-                if (cond_count > 2)
-                    throw std::runtime_error("format should have a maximum of two sections with conditions");
-            }
-
-            // Tokenize
-            struct raw_token { token_type type; int repeat; std::string lit; };
-            std::vector<raw_token> raw_tokens;
-
-            while (pos < raw.size())
-            {
-                const char c = raw[pos];
-
-                if (c == '"')
-                {
-                    const size_t end = raw.find('"', pos + 1);
-                    if (end == std::string::npos) throw std::runtime_error("unterminated quote");
-                    raw_tokens.push_back({token_type::literal, 0, raw.substr(pos + 1, end - pos - 1)});
-                    pos = end + 1; continue;
-                }
-                if (c == '\\' && pos + 1 < raw.size())
-                {
-                    raw_tokens.push_back({token_type::literal, 0, std::string(1, raw[pos + 1])});
-                    pos += 2; continue;
-                }
-                if (c == '_' && pos + 1 < raw.size())
-                {
-                    raw_tokens.push_back({token_type::skip, 0, std::string(1, raw[pos + 1])});
-                    pos += 2; continue;
-                }
-                if (c == '*' && pos + 1 < raw.size())
-                {
-                    raw_tokens.push_back({token_type::fill, 0, std::string(1, raw[pos + 1])});
-                    pos += 2; continue;
-                }
-                if (c == '@')
-                {
-                    raw_tokens.push_back({token_type::text_placeholder, 0, ""});
-                    ++pos; continue;
-                }
-                if (pos + 2 < raw.size() && raw[pos] == '[' && raw[pos + 2] == ']')
-                {
-                    const char mid = static_cast<char>(std::tolower(static_cast<unsigned char>(raw[pos + 1])));
-                    if (mid == 'h') { raw_tokens.push_back({token_type::elapsed_hours, 0, ""}); pos += 3; continue; }
-                    if (mid == 'm') { raw_tokens.push_back({token_type::elapsed_minutes, 0, ""}); pos += 3; continue; }
-                    if (mid == 's') { raw_tokens.push_back({token_type::elapsed_seconds, 0, ""}); pos += 3; continue; }
-                }
-                if ((c == 'E' || c == 'e') && pos + 1 < raw.size() &&
-                    (raw[pos + 1] == '+' || raw[pos + 1] == '-'))
-                {
-                    const bool plus = (raw[pos + 1] == '+');
-                    pos += 2;
-                    int ed = 0;
-                    while (pos < raw.size() && raw[pos] == '0') { ++ed; ++pos; }
-                    if (ed == 0) ed = 1;
-                    raw_tokens.push_back({token_type::scientific, ed, plus ? "+" : "-"});
-                    continue;
-                }
-                if (c == 'y' || c == 'Y')
-                {
-                    int n = 1;
-                    while (pos + n < raw.size() && (raw[pos + n] == 'y' || raw[pos + n] == 'Y')) ++n;
-                    raw_tokens.push_back({n >= 4 ? token_type::year_4 : token_type::year_2, n, ""});
-                    pos += n; continue;
-                }
-                if (c == 'm' || c == 'M')
-                {
-                    int n = 1;
-                    while (pos + n < raw.size() && (raw[pos + n] == 'm' || raw[pos + n] == 'M')) ++n;
-                    token_type t;
-                    if (n >= 5) t = token_type::month_mmmmm;
-                    else if (n == 4) t = token_type::month_mmmm;
-                    else if (n == 3) t = token_type::month_mmm;
-                    else t = (n == 2) ? token_type::month_nn : token_type::month_n;
-                    raw_tokens.push_back({t, n, ""});
-                    pos += n; continue;
-                }
-                if (c == 'd' || c == 'D')
-                {
-                    int n = 1;
-                    while (pos + n < raw.size() && (raw[pos + n] == 'd' || raw[pos + n] == 'D')) ++n;
-                    token_type t;
-                    if (n >= 4) t = token_type::day_dddd;
-                    else if (n == 3) t = token_type::day_ddd;
-                    else if (n == 2) t = token_type::day_dd;
-                    else t = token_type::day_d;
-                    raw_tokens.push_back({t, n, ""});
-                    pos += n; continue;
-                }
-                if (c == 'h' || c == 'H')
-                {
-                    int n = 1;
-                    while (pos + n < raw.size() && (raw[pos + n] == 'h' || raw[pos + n] == 'H')) ++n;
-                    raw_tokens.push_back({n >= 2 ? token_type::hour_hh : token_type::hour_h, n, ""});
-                    pos += n; continue;
-                }
-                if (c == 's' || c == 'S')
-                {
-                    int n = 1;
-                    while (pos + n < raw.size() && (raw[pos + n] == 's' || raw[pos + n] == 'S')) ++n;
-                    raw_tokens.push_back({n >= 2 ? token_type::second_ss : token_type::second_s, n, ""});
-                    pos += n; continue;
-                }
-                if (pos + 4 < raw.size())
-                {
-                    const std::string ampm = raw.substr(pos, 5);
-                    if (ampm == "AM/PM" || ampm == "am/pm")
-                    { raw_tokens.push_back({token_type::am_pm, 0, ampm}); pos += 5; continue; }
-                }
-                if (pos + 2 < raw.size())
-                {
-                    const std::string ap = raw.substr(pos, 3);
-                    if (ap == "A/P" || ap == "a/p")
-                    { raw_tokens.push_back({token_type::am_pm, 0, ap}); pos += 3; continue; }
-                }
-                if (c == '.') { raw_tokens.push_back({token_type::decimal, 0, ""}); ++pos; continue; }
-                if (c == '%') { raw_tokens.push_back({token_type::percent, 0, ""}); ++pos; continue; }
-                if (c == ',') { raw_tokens.push_back({token_type::thousands, 0, ""}); ++pos; continue; }
-                if (c == ':') { raw_tokens.push_back({token_type::literal, 0, ":"}); ++pos; continue; }
-                if (c == '/') { raw_tokens.push_back({token_type::literal, 0, "/"}); ++pos; continue; }
-                if (c == '0')
-                {
-                    int n = 1;
-                    while (pos + n < raw.size() && raw[pos + n] == '0') ++n;
-                    raw_tokens.push_back({token_type::digit_zero, n, ""});
-                    pos += n; continue;
-                }
-                if (c == '#')
-                {
-                    int n = 1;
-                    while (pos + n < raw.size() && raw[pos + n] == '#') ++n;
-                    raw_tokens.push_back({token_type::digit_hash, n, ""});
-                    pos += n; continue;
-                }
-                if (c == '?')
-                {
-                    int n = 1;
-                    while (pos + n < raw.size() && raw[pos + n] == '?') ++n;
-                    raw_tokens.push_back({token_type::digit_qmark, n, ""});
-                    pos += n; continue;
-                }
-                if (c == '(' || c == ')' || c == '-' || c == '+' || c == ' ')
-                {
-                    raw_tokens.push_back({token_type::literal, 0, std::string(1, c)});
-                    ++pos; continue;
-                }
-                throw std::runtime_error(std::string("unexpected character in format: '") + c + "'");
-            }
-
-            // Resolve m/mm ambiguity
-            bool has_h = false, has_d = false, has_y = false;
-            for (auto& rt : raw_tokens)
-            {
-                if (rt.type == token_type::hour_h || rt.type == token_type::hour_hh) has_h = true;
-                if (rt.type == token_type::day_d || rt.type == token_type::day_dd ||
-                    rt.type == token_type::day_ddd || rt.type == token_type::day_dddd) has_d = true;
-                if (rt.type == token_type::year_2 || rt.type == token_type::year_4) has_y = true;
-            }
-            for (size_t i = 0; i < raw_tokens.size(); ++i)
-            {
-                auto& rt = raw_tokens[i];
-                if (rt.type != token_type::month_n && rt.type != token_type::month_nn) continue;
-                const bool after_h = (i > 0 &&
-                    (raw_tokens[i - 1].type == token_type::hour_h || raw_tokens[i - 1].type == token_type::hour_hh));
-                const bool before_s = (i + 1 < raw_tokens.size() &&
-                    (raw_tokens[i + 1].type == token_type::second_s || raw_tokens[i + 1].type == token_type::second_ss ||
-                     raw_tokens[i + 1].type == token_type::frac_second));
-                const bool colon_before = (i > 0 && raw_tokens[i - 1].type == token_type::literal && raw_tokens[i - 1].lit == ":");
-                const bool colon_after = (i + 1 < raw_tokens.size() && raw_tokens[i + 1].type == token_type::literal && raw_tokens[i + 1].lit == ":");
-                if (after_h || before_s || colon_before || colon_after || (has_h && !has_d && !has_y))
-                    rt.type = (rt.type == token_type::month_nn) ? token_type::minute_mm : token_type::minute_m;
-            }
-
-            // Fraction seconds
-            for (size_t i = 0; i < raw_tokens.size(); ++i)
-            {
-                if (raw_tokens[i].type == token_type::decimal &&
-                    i > 0 && (raw_tokens[i - 1].type == token_type::second_s || raw_tokens[i - 1].type == token_type::second_ss))
-                {
-                    int nz = 0; size_t j = i + 1;
-                    while (j < raw_tokens.size() && raw_tokens[j].type == token_type::digit_zero)
-                    { nz += raw_tokens[j].repeat; ++j; }
-                    if (nz > 0)
-                    {
-                        raw_tokens[i].type = token_type::frac_second;
-                        raw_tokens[i].repeat = nz;
-                        for (size_t k = i + 1; k < j; ++k)
-                            raw_tokens[k].type = token_type::literal;
-                    }
-                }
-            }
-
-            // Flatten digit placeholders
-            for (auto& rt : raw_tokens)
-            {
-                if (rt.type == token_type::literal && rt.lit.empty()) continue;
-                const bool is_digit = (rt.type == token_type::digit_zero || rt.type == token_type::digit_hash || rt.type == token_type::digit_qmark);
-                const int count = is_digit ? rt.repeat : 1;
-                for (int r = 0; r < count; ++r)
-                {
-                    token t;
-                    t.type = rt.type;
-                    t.repeat = (rt.type == token_type::frac_second) ? rt.repeat : 1;
-                    if (rt.type == token_type::literal || rt.type == token_type::skip ||
-                        rt.type == token_type::fill || rt.type == token_type::am_pm)
-                        t.literal = rt.lit;
-                    if (rt.type == token_type::scientific)
-                    { t.exp_plus_sign = (rt.lit == "+"); t.exp_digits = rt.repeat; }
-                    sec.tokens.push_back(t);
-                }
-            }
-
-            // Scale from trailing commas
-            sec.scale = 1;
-            int last_digit_pos = -1;
-            for (size_t i = 0; i < sec.tokens.size(); ++i)
-            {
-                const auto tt = sec.tokens[i].type;
-                if (tt == token_type::digit_zero || tt == token_type::digit_hash || tt == token_type::digit_qmark)
-                    last_digit_pos = static_cast<int>(i);
-            }
-            for (size_t i = static_cast<size_t>(last_digit_pos + 1); i < sec.tokens.size(); ++i)
-            {
-                if (sec.tokens[i].type == token_type::thousands)
-                    sec.scale *= 1000;
-                else break;
-            }
+            auto sec = parse_section(raw_sections[i], static_cast<int>(i), condition_count);
             sections.push_back(std::move(sec));
         }
 
@@ -700,15 +471,535 @@ struct number_format::impl
             s.tokens.push_back({token_type::literal, "", 0});
             sections.push_back(std::move(s));
         }
+
+        // ECMA-376: 4th section is the text section (used when formatting strings)
         text_section_idx = (sections.size() >= 4) ? 3 : -1;
     }
 
-    // ---- format: double ----
+private:
+    // Split the format string by ';' into sections.
+    // Respects: quoted strings, bracket groups, and escape sequences.
+    static std::vector<std::string> split_sections(const std::string& fmt)
+    {
+        std::vector<std::string> result;
+        std::string cur;
+        bool in_quote = false, in_bracket = false;
+
+        for (size_t i = 0; i < fmt.size(); ++i)
+        {
+            const char c = fmt[i];
+            if (c == '"' && !in_bracket)      { in_quote = !in_quote; cur += c; continue; }
+            if (!in_quote && c == '[')         { in_bracket = true; cur += c; continue; }
+            if (!in_quote && c == ']')         { in_bracket = false; cur += c; continue; }
+            if (!in_quote && !in_bracket && c == ';') { result.push_back(cur); cur.clear(); continue; }
+            if (c == '\\' && i + 1 < fmt.size())      { cur += c; cur += fmt[++i]; continue; }
+            cur += c;
+        }
+        result.push_back(cur);
+        return result;
+    }
+
+    // Parse one section from its raw string (after bracket removal).
+    // Pipeline: bracket → tokenize → resolve m/mm → detect frac seconds → flatten → scale
+    section parse_section(const std::string& raw, int section_index, int& condition_count)
+    {
+        section sec;
+        sec.section_type = section_index;
+        size_t pos = 0;
+
+        parse_bracket(raw, pos, sec, condition_count);
+        auto raw_tokens = tokenize_section(raw, pos);
+        resolve_mm_ambiguity(raw_tokens);
+        detect_fraction_seconds(raw_tokens);
+        flatten_tokens(raw_tokens, sec.tokens);
+        sec.scale = compute_scale(sec.tokens);
+        return sec;
+    }
+
+    // Parse a leading [bracket] expression.
+    // Three forms:
+    //   [condition]    — e.g., [>100], [<0], [=5], [>=50]
+    //   [ColorName]    — e.g., [Red], [Blue], [Color 3]
+    //   [$-locale]     — e.g., [$USD-409], [$¥-804]
+    // Elapsed time brackets [h]/[hh]/[m]/[mm]/[s]/[ss] are NOT consumed here —
+    // they are handled as inline tokens by tokenize_section.
+    static void parse_bracket(const std::string& raw, size_t& pos, section& sec, int& condition_count)
+    {
+        if (pos >= raw.size() || raw[pos] != '[') return;
+
+        const size_t end = raw.find(']', pos);
+        if (end == std::string::npos) return;
+
+        const std::string bracket = raw.substr(pos + 1, end - pos - 1);
+
+        // Distinguish elapsed time [h/m/s]* from condition, color, or locale.
+        // All chars must be the same letter (h, m, or s).
+        bool is_elapsed = !bracket.empty();
+        if (is_elapsed)
+        {
+            const char first = static_cast<char>(std::tolower(static_cast<unsigned char>(bracket[0])));
+            if (first != 'h' && first != 'm' && first != 's')
+                is_elapsed = false;
+            else
+                for (size_t k = 1; k < bracket.size() && is_elapsed; ++k)
+                    if (static_cast<char>(std::tolower(static_cast<unsigned char>(bracket[k]))) != first)
+                        is_elapsed = false;
+        }
+        const bool is_locale = (!bracket.empty() && bracket[0] == '$');
+
+        if (!is_elapsed && !is_locale)
+        {
+            pos = end + 1;
+
+            // Condition: starts with >, <, or =
+            if (!bracket.empty() && (bracket[0] == '>' || bracket[0] == '<' || bracket[0] == '='))
+            {
+                if (sec.has_condition)
+                    throw std::runtime_error("multiple conditions in one section");
+                if (++condition_count > 2)
+                    throw std::runtime_error("format should have a maximum of two sections with conditions");
+
+                sec.has_condition = true;
+                const char* p = bracket.c_str();
+                     if (p[0] == '>' && p[1] == '=') { sec.condition_op = section::cond_ge; p += 2; }
+                else if (p[0] == '<' && p[1] == '=') { sec.condition_op = section::cond_le; p += 2; }
+                else if (p[0] == '<' && p[1] == '>') { sec.condition_op = section::cond_ne; p += 2; }
+                else if (p[0] == '>')                  { sec.condition_op = section::cond_gt; p += 1; }
+                else if (p[0] == '<')                  { sec.condition_op = section::cond_lt; p += 1; }
+                else if (p[0] == '=')                  { sec.condition_op = section::cond_eq; p += 1; }
+                sec.condition_value = std::strtod(p, nullptr);
+            }
+            else
+            {
+                sec.color = bracket; // [Red], [Blue], etc.
+            }
+        }
+        else if (is_locale)
+        {
+            // [$USD-409] → locale_currency = "USD"
+            auto hyphen = bracket.find('-');
+            if (hyphen != std::string::npos && hyphen > 1)
+                sec.locale_currency = bracket.substr(1, hyphen - 1);
+            pos = end + 1;
+        }
+        // is_elapsed: not consumed here — handled by tokenize_section
+    }
+
+    // Tokenize the body of a section (after bracket removal) into raw_tokens.
+    // Each raw_token may carry a repeat count for digit placeholders.
+    static std::vector<raw_token> tokenize_section(const std::string& raw, size_t pos)
+    {
+        std::vector<raw_token> tokens;
+
+        while (pos < raw.size())
+        {
+            const char c = raw[pos];
+
+            // ---- ECMA-376 special characters ----
+
+            if (c == '"')  // Quoted literal string
+            {
+                const size_t end = raw.find('"', pos + 1);
+                if (end == std::string::npos) throw std::runtime_error("unterminated quote");
+                tokens.push_back({token_type::literal, 0, raw.substr(pos + 1, end - pos - 1)});
+                pos = end + 1; continue;
+            }
+            if (c == '\\' && pos + 1 < raw.size())  // Escaped character
+            {
+                tokens.push_back({token_type::literal, 0, std::string(1, raw[pos + 1])});
+                pos += 2; continue;
+            }
+            if (c == '_' && pos + 1 < raw.size())  // Skip width of next char
+            {
+                tokens.push_back({token_type::skip, 0, std::string(1, raw[pos + 1])});
+                pos += 2; continue;
+            }
+            if (c == '*' && pos + 1 < raw.size())  // Fill with next char
+            {
+                tokens.push_back({token_type::fill, 0, std::string(1, raw[pos + 1])});
+                pos += 2; continue;
+            }
+            if (c == '@')  // Text placeholder
+            {
+                tokens.push_back({token_type::text_placeholder, 0, ""});
+                ++pos; continue;
+            }
+
+            // ---- Elapsed time: [h], [hh], [m], [mm], [s], [ss] (variable-length) ----
+            // Other bracket expressions ([Color], [DBNumX], etc.) are skipped.
+            if (pos < raw.size() && raw[pos] == '[')
+            {
+                const size_t closing = raw.find(']', pos);
+                if (closing != std::string::npos && closing > pos + 1)
+                {
+                    const std::string inner = raw.substr(pos + 1, closing - pos - 1);
+                    const char first = static_cast<char>(std::tolower(static_cast<unsigned char>(inner[0])));
+                    if (first == 'h' || first == 'm' || first == 's')
+                    {
+                        bool all_same = true;
+                        for (size_t k = 1; k < inner.size(); ++k)
+                            if (static_cast<char>(std::tolower(static_cast<unsigned char>(inner[k]))) != first)
+                            { all_same = false; break; }
+                        if (all_same)
+                        {
+                            const int n = static_cast<int>(inner.size());
+                            if (first == 'h') { tokens.push_back({token_type::elapsed_hours, n, ""});   pos = closing + 1; continue; }
+                            if (first == 'm') { tokens.push_back({token_type::elapsed_minutes, n, ""}); pos = closing + 1; continue; }
+                            if (first == 's') { tokens.push_back({token_type::elapsed_seconds, n, ""}); pos = closing + 1; continue; }
+                        }
+                    }
+                    // Not an elapsed time bracket — skip it (e.g., [Red], [DBNum1])
+                    pos = closing + 1;
+                    continue;
+                }
+            }
+
+            // ---- Scientific notation: E+ / E- followed by 0 digits ----
+            if ((c == 'E' || c == 'e') && pos + 1 < raw.size() &&
+                (raw[pos + 1] == '+' || raw[pos + 1] == '-'))
+            {
+                const bool plus = (raw[pos + 1] == '+');
+                pos += 2;
+                int ed = 0;
+                while (pos < raw.size() && raw[pos] == '0') { ++ed; ++pos; }
+                if (ed == 0) ed = 1; // default: at least 1 digit
+                tokens.push_back({token_type::scientific, ed, plus ? "+" : "-"});
+                continue;
+            }
+
+            // ---- Date/time components (repeat counts determine type) ----
+            if (c == 'y' || c == 'Y')  // Year: yy → 2-digit, yyyy+ → 4-digit
+            {
+                int n = 1;
+                while (pos + n < raw.size() && (raw[pos + n] == 'y' || raw[pos + n] == 'Y')) ++n;
+                tokens.push_back({n >= 4 ? token_type::year_4 : token_type::year_2, n, ""});
+                pos += n; continue;
+            }
+            if (c == 'm' || c == 'M')  // Month (or Minute, resolved later): m, mm, mmm, mmmm, mmmmm+
+            {
+                int n = 1;
+                while (pos + n < raw.size() && (raw[pos + n] == 'm' || raw[pos + n] == 'M')) ++n;
+                token_type t;
+                if (n >= 5)      t = token_type::month_mmmmm;
+                else if (n == 4) t = token_type::month_mmmm;
+                else if (n == 3) t = token_type::month_mmm;
+                else             t = (n == 2) ? token_type::month_nn : token_type::month_n;
+                tokens.push_back({t, n, ""});
+                pos += n; continue;
+            }
+            if (c == 'd' || c == 'D')  // Day: d, dd, ddd, dddd+
+            {
+                int n = 1;
+                while (pos + n < raw.size() && (raw[pos + n] == 'd' || raw[pos + n] == 'D')) ++n;
+                token_type t;
+                if (n >= 4)      t = token_type::day_dddd;
+                else if (n == 3) t = token_type::day_ddd;
+                else if (n == 2) t = token_type::day_dd;
+                else             t = token_type::day_d;
+                tokens.push_back({t, n, ""});
+                pos += n; continue;
+            }
+            if (c == 'h' || c == 'H')  // Hour: h, hh
+            {
+                int n = 1;
+                while (pos + n < raw.size() && (raw[pos + n] == 'h' || raw[pos + n] == 'H')) ++n;
+                tokens.push_back({n >= 2 ? token_type::hour_hh : token_type::hour_h, n, ""});
+                pos += n; continue;
+            }
+            if (c == 's' || c == 'S')  // Second: s, ss
+            {
+                int n = 1;
+                while (pos + n < raw.size() && (raw[pos + n] == 's' || raw[pos + n] == 'S')) ++n;
+                tokens.push_back({n >= 2 ? token_type::second_ss : token_type::second_s, n, ""});
+                pos += n; continue;
+            }
+
+            // ---- AM/PM (5 chars) and A/P (3 chars) — case-insensitive per ECMA-376 ----
+            if (pos + 4 < raw.size())
+            {
+                const std::string ampm = raw.substr(pos, 5);
+                if ((ampm[0] == 'A' || ampm[0] == 'a') &&
+                    (ampm[1] == 'M' || ampm[1] == 'm') &&
+                    ampm[2] == '/' &&
+                    (ampm[3] == 'P' || ampm[3] == 'p') &&
+                    (ampm[4] == 'M' || ampm[4] == 'm'))
+                { tokens.push_back({token_type::am_pm, 0, ampm}); pos += 5; continue; }
+            }
+            if (pos + 2 < raw.size())
+            {
+                const std::string ap = raw.substr(pos, 3);
+                if ((ap[0] == 'A' || ap[0] == 'a') &&
+                    ap[1] == '/' &&
+                    (ap[2] == 'P' || ap[2] == 'p'))
+                { tokens.push_back({token_type::am_pm, 0, ap}); pos += 3; continue; }
+            }
+
+            // ---- Single-character tokens ----
+            if (c == '.')      { tokens.push_back({token_type::decimal, 0, ""}); ++pos; continue; }
+            if (c == '%')      { tokens.push_back({token_type::percent, 0, ""}); ++pos; continue; }
+            if (c == ',')      { tokens.push_back({token_type::thousands, 0, ""}); ++pos; continue; }
+            if (c == ':')      { tokens.push_back({token_type::literal, 0, ":"}); ++pos; continue; }
+            if (c == '/')      { tokens.push_back({token_type::literal, 0, "/"}); ++pos; continue; }
+
+            // ---- Digit placeholders (with repeat counts) ----
+            if (c == '0')
+            {
+                int n = 1;
+                while (pos + n < raw.size() && raw[pos + n] == '0') ++n;
+                tokens.push_back({token_type::digit_zero, n, ""});
+                pos += n; continue;
+            }
+            if (c >= '1' && c <= '9')
+            {
+                tokens.push_back({token_type::digit_zero, 1, std::string(1, c)});
+                ++pos; continue;
+            }
+            if (c == '#')
+            {
+                int n = 1;
+                while (pos + n < raw.size() && raw[pos + n] == '#') ++n;
+                tokens.push_back({token_type::digit_hash, n, ""});
+                pos += n; continue;
+            }
+            if (c == '?')
+            {
+                int n = 1;
+                while (pos + n < raw.size() && raw[pos + n] == '?') ++n;
+                tokens.push_back({token_type::digit_qmark, n, ""});
+                pos += n; continue;
+            }
+
+            // ---- Characters that are literal without escaping ----
+            if (c == '(' || c == ')' || c == '-' || c == '+' || c == ' ')
+            {
+                tokens.push_back({token_type::literal, 0, std::string(1, c)});
+                ++pos; continue;
+            }
+
+            throw std::runtime_error(std::string("unexpected character in format: '") + c + "'");
+        }
+        return tokens;
+    }
+
+    // Resolve the m/mm ambiguity: are they months or minutes?
+    //
+    // ECMA-376 rule: m/mm immediately after h/hh or immediately before s/ss
+    // is a minute. Also, if there's an h token and no d or y tokens, m/mm
+    // are minutes (this is a pure time format).
+    static void resolve_mm_ambiguity(std::vector<raw_token>& tokens)
+    {
+        bool has_h = false, has_d = false, has_y = false;
+        for (auto& rt : tokens)
+        {
+            if (rt.type == token_type::hour_h || rt.type == token_type::hour_hh) has_h = true;
+            if (rt.type == token_type::day_d  || rt.type == token_type::day_dd ||
+                rt.type == token_type::day_ddd || rt.type == token_type::day_dddd) has_d = true;
+            if (rt.type == token_type::year_2 || rt.type == token_type::year_4) has_y = true;
+        }
+
+        for (size_t i = 0; i < tokens.size(); ++i)
+        {
+            auto& rt = tokens[i];
+            if (rt.type != token_type::month_n && rt.type != token_type::month_nn) continue;
+
+            const bool after_h  = (i > 0 && (tokens[i - 1].type == token_type::hour_h || tokens[i - 1].type == token_type::hour_hh));
+            const bool before_s = (i + 1 < tokens.size() &&
+                (tokens[i + 1].type == token_type::second_s || tokens[i + 1].type == token_type::second_ss ||
+                 tokens[i + 1].type == token_type::frac_second));
+            const bool col_before = (i > 0 && tokens[i - 1].type == token_type::literal && tokens[i - 1].lit == ":");
+            const bool col_after  = (i + 1 < tokens.size() && tokens[i + 1].type == token_type::literal && tokens[i + 1].lit == ":");
+
+            if (after_h || before_s || col_before || col_after || (has_h && !has_d && !has_y))
+                rt.type = (rt.type == token_type::month_nn) ? token_type::minute_mm : token_type::minute_m;
+        }
+    }
+
+    // Detect fractional seconds: ".000" immediately after "s" or "ss".
+    // Converts the decimal token to frac_second and marks the following zeros
+    // as consumed (empty literal type, skipped by flatten_tokens).
+    static void detect_fraction_seconds(std::vector<raw_token>& tokens)
+    {
+        for (size_t i = 0; i < tokens.size(); ++i)
+        {
+            if (tokens[i].type != token_type::decimal) continue;
+            if (i == 0) continue;
+            const auto prev = tokens[i - 1].type;
+            if (prev != token_type::second_s && prev != token_type::second_ss) continue;
+
+            int nz = 0;
+            size_t j = i + 1;
+            while (j < tokens.size() && tokens[j].type == token_type::digit_zero)
+            { nz += tokens[j].repeat; ++j; }
+
+            if (nz > 0)
+            {
+                tokens[i].type = token_type::frac_second;
+                tokens[i].repeat = nz;
+                // Mark consumed zero tokens as empty literal so flatten_tokens skips them
+                for (size_t k = i + 1; k < j; ++k)
+                    { tokens[k].type = token_type::literal; tokens[k].lit.clear(); }
+            }
+        }
+    }
+
+    // Expand raw_tokens with repeat counts into individual tokens.
+    // E.g., "000" (digit_zero, repeat=3) → 3 individual digit_zero tokens.
+    // Elapsed time and frac_second tokens propagate their repeat count for zero-padding.
+    static void flatten_tokens(const std::vector<raw_token>& raw_tokens, std::vector<token>& out)
+    {
+        for (auto& rt : raw_tokens)
+        {
+            if (rt.type == token_type::literal && rt.lit.empty()) continue;
+
+            const int count = is_digit_token(rt.type) ? rt.repeat : 1;
+            for (int r = 0; r < count; ++r)
+            {
+                token t;
+                t.type = rt.type;
+                t.repeat = (rt.type == token_type::frac_second ||
+                            rt.type == token_type::elapsed_hours ||
+                            rt.type == token_type::elapsed_minutes ||
+                            rt.type == token_type::elapsed_seconds) ? rt.repeat : 1;
+
+                if (rt.type == token_type::literal || rt.type == token_type::skip ||
+                    rt.type == token_type::fill || rt.type == token_type::am_pm ||
+                    is_digit_token(rt.type))
+                    t.literal = rt.lit;
+                if (rt.type == token_type::scientific)
+                { t.exp_plus_sign = (rt.lit == "+"); t.exp_digits = rt.repeat; }
+                out.push_back(t);
+            }
+        }
+    }
+
+    // Compute the scale divisor from trailing commas.
+    // ECMA-376: each comma after the last digit placeholder divides by 1000.
+    // E.g., "#,##0,," → scale = 1,000,000
+    static int compute_scale(const std::vector<token>& tokens)
+    {
+        int last_digit = -1;
+        for (size_t i = 0; i < tokens.size(); ++i)
+            if (is_digit_token(tokens[i].type))
+                last_digit = static_cast<int>(i);
+
+        if (last_digit < 0) return 1; // no digit tokens → no scale
+
+        int scale = 1;
+        for (size_t i = static_cast<size_t>(last_digit + 1); i < tokens.size(); ++i)
+        {
+            if (tokens[i].type == token_type::thousands) scale *= 1000;
+            else break;
+        }
+        return scale;
+    }
+
+public:
+    // =========================================================================
+    // Section selection — ECMA-376 §18.8.31 section ordering
+    //
+    // Priority:
+    //   1. Condition sections ([>100], [<0], etc.) — first match wins
+    //   2. If conditions exist but none matched → first unconditional section
+    //   3. Standard 1/2/3-section logic:
+    //      1 section  → applies to all numbers
+    //      2 sections → [0] positive/zero, [1] negative
+    //      3 sections → [0] positive, [1] negative, [2] zero
+    // =========================================================================
+
+    const section* select_section(double number) const noexcept
+    {
+        if (sections.empty()) return nullptr;
+
+        // Step 1: evaluate condition sections
+        bool any_condition = false;
+        for (auto& sec : sections)
+            if (sec.has_condition) { any_condition = true; break; }
+
+        if (any_condition)
+        {
+            for (auto& sec : sections)
+            {
+                if (!sec.has_condition) continue;
+                if (condition_matches(sec, number)) return &sec;
+            }
+            // No condition matched → fall back to first unconditional section
+            for (auto& sec : sections)
+                if (!sec.has_condition) return &sec;
+        }
+
+        // Step 2: standard positive/negative/zero selection
+        const size_t n = sections.size();
+        if (n == 1)       return &sections[0];
+        else if (n == 2)  return (number < 0) ? &sections[1] : &sections[0];
+        else              return number > 0 ? &sections[0] : number < 0 ? &sections[1] : &sections[2];
+    }
+
+private:
+    static bool condition_matches(const section& sec, double number) noexcept
+    {
+        switch (sec.condition_op)
+        {
+        case section::cond_gt: return number > sec.condition_value + float_epsilon;
+        case section::cond_ge: return number >= sec.condition_value - float_epsilon;
+        case section::cond_lt: return number < sec.condition_value - float_epsilon;
+        case section::cond_le: return number <= sec.condition_value + float_epsilon;
+        case section::cond_eq: return std::fabs(number - sec.condition_value) < float_epsilon;
+        case section::cond_ne: return std::fabs(number - sec.condition_value) >= float_epsilon;
+        default: return false;
+        }
+    }
+
+public:
+    // =========================================================================
+    // Section analysis — classify what kind of formatting a section contains
+    // =========================================================================
+
+    static section_info analyze_section(const section& sec) noexcept
+    {
+        section_info info;
+        for (size_t i = 0; i < sec.tokens.size(); ++i)
+        {
+            const auto tt = sec.tokens[i].type;
+
+            if (is_digit_token(tt))
+            {
+                info.has_digits = true;
+                // Detect fraction format: digit after "/" with a digit before it
+                if (!info.is_fraction)
+                    info.is_fraction = is_fraction_denominator(sec.tokens, i);
+            }
+            else if (tt == token_type::percent)
+                info.has_percent = true;
+            else if (tt == token_type::scientific)
+                info.has_scientific = true;
+            else if (tt == token_type::am_pm)
+                info.has_ampm = true;
+            else if (is_date_token(tt) || is_time_token(tt))
+                info.has_date_time = true;
+        }
+        return info;
+    }
+
+private:
+    // A digit token is a fraction denominator if it follows "/" and
+    // there is a digit before the "/" (the numerator).
+    static bool is_fraction_denominator(const std::vector<token>& tokens, size_t pos) noexcept
+    {
+        if (pos < 2) return false;
+        if (tokens[pos - 1].type != token_type::literal || tokens[pos - 1].literal != "/")
+            return false;
+        return is_digit_token(tokens[pos - 2].type);
+    }
+
+public:
+    // =========================================================================
+    // format: double — main entry point
+    // =========================================================================
 
     std::string format_double(double number, bool date1904) const
     {
-        if (std::isnan(number)) return "#NUM!";
-        if (std::isinf(number)) return number > 0 ? "#INF!" : "-#INF!";
+        // ECMA-376: NaN and INF both display as #NUM!
+        if (std::isnan(number) || std::isinf(number)) return "#NUM!";
 
         if (is_general || sections.empty())
             return format_number_general(number);
@@ -716,31 +1007,13 @@ struct number_format::impl
         const section* sec = select_section(number);
         if (!sec) return format_number_general(number);
 
-        if (sec->section_type == 3)
-        {
-            std::string result;
-            for (auto& tok : sec->tokens)
-            {
-                if (tok.type == token_type::text_placeholder)   result += format_number_general(number);
-                else if (tok.type == token_type::literal)       result += tok.literal;
-                else if (tok.type == token_type::skip)          result += ' ';
-            }
-            return result;
-        }
-
         const section_info info = analyze_section(*sec);
-        if (!info.has_digits && !info.has_date_time)
-        {
-            std::string result;
-            for (auto& tok : sec->tokens)
-            {
-                if (tok.type == token_type::literal)            result += tok.literal;
-                else if (tok.type == token_type::text_placeholder) result += format_number_general(number);
-                else if (tok.type == token_type::skip)          result += ' ';
-            }
-            return result;
-        }
 
+        // No digit or date/time tokens → pure literal template (handles text sections with @)
+        if (!info.has_digits && !info.has_date_time)
+            return render_literal_template(*sec, number);
+
+        // Check if the negative section provides its own sign (e.g., "(#,##0)")
         bool neg_section_owns_sign = false;
         if (number < 0 && sections.size() >= 2 && sec == &sections[1])
         {
@@ -755,20 +1028,42 @@ struct number_format::impl
             }
         }
 
+        // ECMA-376: negative dates/times are not valid — display as "###########"
         if (number < 0 && info.has_date_time)
             return std::string(default_cell_width, '#');
 
-        if (info.has_date_time)
-            return format_date_time_section(*sec, std::fabs(number), date1904, info.has_ampm);
-        if (info.is_fraction)
-            return format_fraction_section(*sec, number, neg_section_owns_sign, info.has_percent);
-        if (info.has_scientific)
-            return format_scientific_section(*sec, number, neg_section_owns_sign, info.has_percent);
+        // Dispatch to the appropriate specialized formatter
+        if (info.has_date_time)  return format_date_time_section(*sec, std::fabs(number), date1904, info.has_ampm);
+        if (info.is_fraction)    return format_fraction_section(*sec, number, neg_section_owns_sign, info.has_percent);
+        if (info.has_scientific) return format_scientific_section(*sec, number, neg_section_owns_sign, info.has_percent);
 
         return format_regular_number_section(*sec, number, neg_section_owns_sign, info.has_percent);
     }
 
-    // ---- format: string ----
+private:
+    // Render a section that has no digit or date/time tokens — just literals,
+    // text placeholders, and skip tokens.
+    static std::string render_literal_template(const section& sec, double number)
+    {
+        std::string result;
+        for (auto& tok : sec.tokens)
+        {
+            if (tok.type == token_type::text_placeholder)   result += format_number_general(number);
+            else if (tok.type == token_type::literal)       result += tok.literal;
+            else if (tok.type == token_type::skip)          result += ' ';
+        }
+        return result;
+    }
+
+public:
+    // =========================================================================
+    // format: string — ECMA-376 text section formatting
+    //
+    // Uses the 4th section if available, otherwise the 1st section.
+    // If the section contains @, the text replaces @. Otherwise, if the
+    // section contains only literals/skips/fills, it's used as a template.
+    // If it contains digit placeholders, the raw text is returned unchanged.
+    // =========================================================================
 
     std::string format_text(const std::string& text) const
     {
@@ -779,24 +1074,27 @@ struct number_format::impl
             : &sections[0];
 
         std::string result;
-        bool has_text_placeholder = false;
+        bool has_placeholder = false;
         for (auto& tok : text_sec->tokens)
         {
-            if (tok.type == token_type::text_placeholder) { result += text; has_text_placeholder = true; }
+            if (tok.type == token_type::text_placeholder) { result += text; has_placeholder = true; }
             else if (tok.type == token_type::literal)       result += tok.literal;
             else if (tok.type == token_type::skip)          result += ' ';
         }
 
-        if (!has_text_placeholder && !text_sec->tokens.empty())
+        // If no @ placeholder, check if the section is a pure template
+        if (!has_placeholder && !text_sec->tokens.empty())
         {
             for (auto& tok : text_sec->tokens)
-                if (tok.type != token_type::literal && tok.type != token_type::skip && tok.type != token_type::fill)
-                    return text;
+                if (!(tok.type == token_type::literal || tok.type == token_type::skip || tok.type == token_type::fill))
+                    return text; // contains digit/date tokens → return raw text
         }
         return result;
     }
 
-    // ---- format: date/time section ----
+    // =========================================================================
+    // format: date/time section
+    // =========================================================================
 
     std::string format_date_time_section(const section& sec, double raw_value, bool date1904, bool has_ampm) const
     {
@@ -810,54 +1108,31 @@ struct number_format::impl
         {
             switch (tok.type)
             {
-            case token_type::year_2:   append_pad2(result, dp.year % 100); break;
-            case token_type::year_4:   append_pad4(result, dp.year); break;
-            case token_type::month_n:   append_int(result, dp.month); break;
-            case token_type::month_nn:  append_pad2(result, dp.month); break;
-            case token_type::month_mmm:  result += month_abbr[month_idx]; break;
-            case token_type::month_mmmm: result += month_names[month_idx]; break;
+            case token_type::year_2:      append_pad2(result, dp.year % 100); break;
+            case token_type::year_4:      append_pad4(result, dp.year); break;
+            case token_type::month_n:     append_int(result, dp.month); break;
+            case token_type::month_nn:    append_pad2(result, dp.month); break;
+            case token_type::month_mmm:   result += month_abbr[month_idx]; break;
+            case token_type::month_mmmm:  result += month_names[month_idx]; break;
             case token_type::month_mmmmm: result += month_names[month_idx][0]; break;
-            case token_type::day_d:    append_int(result, dp.day); break;
-            case token_type::day_dd:   append_pad2(result, dp.day); break;
-            case token_type::day_ddd:  result += day_abbr[static_cast<size_t>(dp.dow)]; break;
-            case token_type::day_dddd: result += day_names[static_cast<size_t>(dp.dow)]; break;
-            case token_type::hour_h:
-                if (has_ampm) { int h = dp.hour % 12; if (h == 0) h = 12; append_int(result, h); }
-                else append_int(result, dp.hour);
-                break;
-            case token_type::hour_hh:
-                if (has_ampm) { int h = dp.hour % 12; if (h == 0) h = 12; append_pad2(result, h); }
-                else append_pad2(result, dp.hour);
-                break;
-            case token_type::minute_m:  append_int(result, dp.minute); break;
-            case token_type::minute_mm: append_pad2(result, dp.minute); break;
-            case token_type::second_s:  append_int(result, dp.second); break;
-            case token_type::second_ss: append_pad2(result, dp.second); break;
-            case token_type::am_pm:
-            {
-                const bool pm = dp.hour >= 12;
-                const auto& lit = tok.literal;
-                result += lit.size() == 5
-                    ? (pm ? (lit[0] == 'A' ? "PM" : "pm") : (lit[0] == 'A' ? "AM" : "am"))
-                    : (pm ? (lit[0] == 'A' ? "P"  : "p")  : (lit[0] == 'A' ? "A"  : "a"));
-                break;
-            }
-            case token_type::frac_second:
-            {
-                const double pv = pow10[static_cast<size_t>(tok.repeat)];
-                int fv = static_cast<int>(std::round(dp.fsec * pv));
-                if (fv >= static_cast<int>(pv)) fv = static_cast<int>(pv) - 1;
-                char fb[16];
-                auto r = std::to_chars(fb, fb + sizeof(fb), fv);
-                const int len = static_cast<int>(r.ptr - fb);
-                result += '.';
-                for (int k = len; k < tok.repeat; ++k) result += '0';
-                result.append(fb, static_cast<size_t>(len));
-                break;
-            }
-            case token_type::elapsed_hours:   append_int(result, static_cast<int>(std::floor(raw_value * 24))); break;
-            case token_type::elapsed_minutes: append_int(result, static_cast<int>(std::floor(raw_value * 24 * 60))); break;
-            case token_type::elapsed_seconds: append_int(result, static_cast<int>(std::floor(raw_value * 24 * 3600))); break;
+            case token_type::day_d:       append_int(result, dp.day); break;
+            case token_type::day_dd:      append_pad2(result, dp.day); break;
+            case token_type::day_ddd:     result += day_abbr[static_cast<size_t>(dp.dow)]; break;
+            case token_type::day_dddd:    result += day_names[static_cast<size_t>(dp.dow)]; break;
+            case token_type::hour_h:      format_hour(result, dp.hour, has_ampm, false); break;
+            case token_type::hour_hh:     format_hour(result, dp.hour, has_ampm, true); break;
+            case token_type::minute_m:    append_int(result, dp.minute); break;
+            case token_type::minute_mm:   append_pad2(result, dp.minute); break;
+            case token_type::second_s:    append_int(result, dp.second); break;
+            case token_type::second_ss:   append_pad2(result, dp.second); break;
+            case token_type::am_pm:       append_ampm(result, tok.literal, dp.hour >= 12); break;
+            case token_type::frac_second: append_frac_second(result, dp.fsec, tok.repeat); break;
+            case token_type::elapsed_hours:
+                append_padded(result, static_cast<int>(std::floor(raw_value * 24)), tok.repeat); break;
+            case token_type::elapsed_minutes:
+                append_padded(result, static_cast<int>(std::floor(raw_value * 24 * 60)), tok.repeat); break;
+            case token_type::elapsed_seconds:
+                append_padded(result, static_cast<int>(std::floor(raw_value * 24 * 3600)), tok.repeat); break;
             case token_type::literal: result += tok.literal; break;
             case token_type::skip:    result += ' '; break;
             case token_type::fill:    result += tok.literal; break;
@@ -867,10 +1142,63 @@ struct number_format::impl
         return result;
     }
 
-    // ---- format: fraction section ----
+private:
+    // Format hour with optional 12-hour conversion and padding
+    static void format_hour(std::string& out, int hour, bool has_ampm, bool pad2) noexcept
+    {
+        int h = has_ampm ? (hour % 12 == 0 ? 12 : hour % 12) : hour;
+        if (pad2) append_pad2(out, h); else append_int(out, h);
+    }
+
+    // Append AM/PM or A/P string, preserving the original case pattern
+    static void append_ampm(std::string& out, const std::string& pattern, bool pm) noexcept
+    {
+        if (pattern.size() == 5) // "AM/PM" or "am/pm"
+            out += pm ? (pattern[0] == 'A' ? "PM" : "pm") : (pattern[0] == 'A' ? "AM" : "am");
+        else // "A/P" or "a/p"
+            out += pm ? (pattern[0] == 'A' ? "P" : "p") : (pattern[0] == 'A' ? "A" : "a");
+    }
+
+    // Append fractional seconds with leading zeros and rounding
+    static void append_frac_second(std::string& out, double fsec, int repeat) noexcept
+    {
+        const double pv = pow10_safe(repeat);
+        int fv = static_cast<int>(std::round(fsec * pv));
+        if (fv >= static_cast<int>(pv)) fv = static_cast<int>(pv) - 1; // clamp to avoid overflow
+
+        char buf[16];
+        auto r = std::to_chars(buf, buf + sizeof(buf), fv);
+        const int len = static_cast<int>(r.ptr - buf);
+
+        out += '.';
+        for (int k = len; k < repeat; ++k) out += '0';
+        out.append(buf, static_cast<size_t>(len));
+    }
+
+public:
+    // =========================================================================
+    // format: fraction section — ECMA-376 §18.8.31 fraction formats
+    //
+    // Examples: "# ?/?", "# ??/??", "# ?/2", "# ?/4", "# ?/8"
+    //
+    // Token structure (flattened):
+    //   [digit_tokens_int] [space] [digit_tokens_num] [/] [digit_tokens_den]
+    //   or without integer part:
+    //   [digit_tokens_num] [/] [digit_tokens_den]
+    //
+    // Algorithm:
+    //   1. Analyze fraction layout from tokens (find '/', count digit groups)
+    //   2. Extract integer part and find best rational approximation of fraction
+    //   3. Walk tokens, substituting digit groups with formatted values,
+    //      preserving surrounding literals, skips, and fills
+    // =========================================================================
 
     std::string format_fraction_section(const section& sec, double raw_value, bool neg_section_owns_sign, bool has_percent) const
     {
+        // Step 1: analyze the fraction layout from tokens
+        const fraction_layout fl = analyze_fraction_layout(sec);
+
+        // Step 2: compute the fraction values
         double scaled = raw_value / sec.scale;
         const bool negative = scaled < 0;
         if (negative) scaled = -scaled;
@@ -879,53 +1207,171 @@ struct number_format::impl
         int int_part = static_cast<int>(std::floor(scaled));
         const double frac_part = scaled - int_part;
 
-        int frac_dd = 0;
-        for (size_t i = 1; i + 1 < sec.tokens.size(); ++i)
+        int max_den = static_cast<int>(pow10_safe(fl.den_digits)) - 1;
+        if (max_den < 1) max_den = 99;
+
+        // Check for fixed denominator (e.g., # ?/2, # ?/4, # ?/8)
+        int fixed_den = 0;
+        if (fl.slash_pos >= 0)
         {
-            if (sec.tokens[i].type == token_type::literal && sec.tokens[i].literal == "/")
+            for (int i = fl.slash_pos + 1; i < static_cast<int>(sec.tokens.size()); ++i)
             {
-                for (size_t j = i + 1; j < sec.tokens.size(); ++j)
-                {
-                    const auto tt = sec.tokens[j].type;
-                    if (tt == token_type::digit_zero || tt == token_type::digit_hash || tt == token_type::digit_qmark)
-                        frac_dd += sec.tokens[j].repeat;
-                    else break;
-                }
-                break;
+                const auto& dt = sec.tokens[i];
+                if (!is_digit_token(dt.type)) break;
+                if (!dt.literal.empty() && dt.literal[0] >= '1' && dt.literal[0] <= '9')
+                    fixed_den = fixed_den * 10 + (dt.literal[0] - '0');
+                else
+                    fixed_den = fixed_den * 10; // '0' placeholder — digit position, not fixed
             }
         }
 
-        int max_den = static_cast<int>(pow10[static_cast<size_t>(frac_dd)]) - 1;
-        if (max_den < 1) max_den = 99;
-
         int best_num, best_den;
-        best_fraction(frac_part, max_den, best_num, best_den);
-        if (best_num == best_den) { ++int_part; best_num = 0; best_den = 1; }
-
-        bool has_int = false;
-        for (auto& tok : sec.tokens)
+        if (fixed_den > 0)
         {
-            if (tok.type == token_type::digit_zero || tok.type == token_type::digit_hash || tok.type == token_type::digit_qmark)
-            { has_int = true; break; }
-            if (tok.type == token_type::literal && tok.literal == "/") break;
-            if (tok.type == token_type::literal && tok.literal == " ") { has_int = true; break; }
+            best_num = static_cast<int>(std::round(frac_part * fixed_den));
+            best_den = fixed_den;
+        }
+        else
+        {
+            best_fraction(frac_part, max_den, best_num, best_den);
         }
 
+        // If fraction rounds to 1, carry to integer part
+        if (best_num == best_den) { ++int_part; best_num = 0; best_den = 1; }
+
+        const bool no_fraction = (best_num == 0);
+
+        // Step 3: format the number strings with ? → space padding for alignment
+        const bool has_int = (fl.int_digits > 0);
+
+        std::string int_str;
+        if (has_int || int_part > 0)
+            int_str = std::to_string(int_part);
+        if (static_cast<int>(int_str.size()) < fl.int_digits)
+            int_str.insert(0, static_cast<size_t>(fl.int_digits - static_cast<int>(int_str.size())), ' ');
+
+        std::string num_str = std::to_string(best_num);
+        std::string den_str = std::to_string(best_den);
+        if (static_cast<int>(num_str.size()) < fl.num_qmarks)
+            num_str.insert(0, static_cast<size_t>(fl.num_qmarks - static_cast<int>(num_str.size())), ' ');
+        if (static_cast<int>(den_str.size()) < fl.den_qmarks)
+            den_str.append(static_cast<size_t>(fl.den_qmarks - static_cast<int>(den_str.size())), ' ');
+
+        // Step 4: walk tokens to build output, preserving surrounding text
         std::string result;
         result.reserve(32);
         if (negative && !neg_section_owns_sign) result += '-';
-        if (has_int || int_part > 0) result += std::to_string(int_part);
-        if (best_num > 0 || best_den > 1)
+
+        bool int_output = false, num_output = false, den_output = false;
+
+        for (size_t i = 0; i < sec.tokens.size(); ++i)
         {
-            if (has_int || int_part > 0) result += ' ';
-            result += std::to_string(best_num);
-            result += '/';
-            result += std::to_string(best_den);
+            const auto& tok = sec.tokens[i];
+            const auto tt = tok.type;
+
+            // Literals, skips, and fills are output as-is
+            if (tt == token_type::literal)
+            {
+                if (tok.literal == "/") { if (!no_fraction) result += '/'; continue; }
+                // Suppress the space separator between integer and fraction when no fraction is shown
+                if (no_fraction && fl.space_pos >= 0 && static_cast<int>(i) == fl.space_pos && tok.literal == " ")
+                    continue;
+                result += tok.literal;
+                continue;
+            }
+            if (tt == token_type::skip) { result += ' '; continue; }
+            if (tt == token_type::fill) { result += tok.literal; continue; }
+
+            // Digit placeholders: substitute with the appropriate formatted value
+            if (is_digit_token(tt))
+            {
+                const int idx = static_cast<int>(i);
+                if (idx > fl.slash_pos)
+                {
+                    // Denominator — suppress when no fraction
+                    if (!no_fraction && !den_output) { result += den_str; den_output = true; }
+                }
+                else if (fl.space_pos >= 0 && idx < fl.space_pos)
+                {
+                    // Integer part
+                    if (!int_output) { result += int_str; int_output = true; }
+                }
+                else
+                {
+                    // Numerator — suppress when no fraction
+                    if (!no_fraction && !num_output) { result += num_str; num_output = true; }
+                }
+            }
         }
         return result;
     }
 
-    // ---- format: scientific section ----
+private:
+    // Analyze the fraction layout from a flattened token vector.
+    // Finds the '/' position, counts digit groups on each side,
+    // and identifies the space separator that marks the integer part.
+    static fraction_layout analyze_fraction_layout(const section& sec) noexcept
+    {
+        fraction_layout fl;
+
+        // Find the '/' position
+        for (size_t i = 0; i < sec.tokens.size(); ++i)
+            if (sec.tokens[i].type == token_type::literal && sec.tokens[i].literal == "/")
+            { fl.slash_pos = static_cast<int>(i); break; }
+
+        if (fl.slash_pos < 0) return fl;
+
+        // Count denominator digits (after '/')
+        for (int i = fl.slash_pos + 1; i < static_cast<int>(sec.tokens.size()); ++i)
+        {
+            const auto tt = sec.tokens[i].type;
+            if (is_digit_token(tt))
+            { ++fl.den_digits; if (tt == token_type::digit_qmark) ++fl.den_qmarks; }
+            else
+                break;
+        }
+
+        // Count numerator digits (immediately before '/')
+        for (int i = fl.slash_pos - 1; i >= 0; --i)
+        {
+            const auto tt = sec.tokens[i].type;
+            if (is_digit_token(tt))
+            { ++fl.num_digits; if (tt == token_type::digit_qmark) ++fl.num_qmarks; }
+            else
+                break;
+        }
+
+        // Check for space separator (indicating integer part exists)
+        // Space is between the integer digit group and the numerator digit group
+        int sep_pos = fl.slash_pos - 1 - fl.num_digits;
+        if (sep_pos >= 0 && sec.tokens[sep_pos].type == token_type::literal &&
+            sec.tokens[sep_pos].literal == " ")
+        {
+            fl.space_pos = sep_pos;
+            // Count integer digits (before the space)
+            for (int i = sep_pos - 1; i >= 0; --i)
+            {
+                if (is_digit_token(sec.tokens[i].type))
+                    ++fl.int_digits;
+                else
+                    break;
+            }
+        }
+
+        return fl;
+    }
+
+public:
+    // =========================================================================
+    // format: scientific section — ECMA-376 §18.8.31 scientific notation
+    //
+    // Format: "0.00E+00" → mantissa with digit placeholders, then E+/- with digits
+    //
+    // Algorithm:
+    //   1. Normalize number to 1.xxx * 10^exp
+    //   2. Round mantissa to the precision specified by placeholders before E
+    //   3. Format exponent with the specified number of digits
+    // =========================================================================
 
     std::string format_scientific_section(const section& sec, double raw_value, bool neg_section_owns_sign, bool has_percent) const
     {
@@ -934,6 +1380,7 @@ struct number_format::impl
         if (negative) value = -value;
         if (has_percent) value *= 100.0;
 
+        // Locate the scientific token (E+ or E-)
         int sci_pos = -1;
         token sci_tok;
         for (size_t i = 0; i < sec.tokens.size(); ++i)
@@ -941,163 +1388,162 @@ struct number_format::impl
             if (sec.tokens[i].type == token_type::scientific) { sci_tok = sec.tokens[i]; sci_pos = static_cast<int>(i); break; }
         }
 
+        // Compute mantissa and exponent
         int exponent = 0;
         double mantissa = value;
         if (mantissa != 0.0)
         {
             exponent = static_cast<int>(std::floor(std::log10(mantissa)));
-            mantissa = mantissa / std::pow(10.0, exponent);
+            mantissa = mantissa / pow10_safe(exponent);
         }
 
-        int int_zeros = 0, int_hashes = 0, frac_zeros = 0, frac_hashes = 0;
-        bool past_decimal = false;
-        for (int i = 0; i < sci_pos; ++i)
-        {
-            const auto tt = sec.tokens[i].type;
-            if (tt == token_type::decimal) { past_decimal = true; continue; }
-            if (!past_decimal)
-            {
-                if (tt == token_type::digit_zero) int_zeros += sec.tokens[i].repeat;
-                else if (tt == token_type::digit_hash) int_hashes += sec.tokens[i].repeat;
-            }
-            else
-            {
-                if (tt == token_type::digit_zero) frac_zeros += sec.tokens[i].repeat;
-                else if (tt == token_type::digit_hash) frac_hashes += sec.tokens[i].repeat;
-            }
-        }
+        // Count digit placeholders up to the E token for precision
+        const auto dc = count_digit_placeholders(sec, sci_pos);
+        const int total_frac = dc.total_frac();
 
-        const int total_frac_digits = frac_zeros + frac_hashes;
-        const double round_factor = pow10[static_cast<size_t>(total_frac_digits)];
+        // Round mantissa to the specified fractional precision
+        const double round_factor = pow10_safe(total_frac);
         mantissa = std::round(mantissa * round_factor) / round_factor;
-        if (mantissa >= 10.0 - 1e-12) { mantissa = 1.0; exponent += 1; }
+        if (mantissa >= 10.0 - 1e-12) { mantissa = 1.0; exponent += 1; } // handle rounding overflow
 
+        // Format mantissa integer part
         const int m_int = static_cast<int>(std::floor(mantissa));
-        std::string m_int_str = std::to_string(m_int);
-        while (static_cast<int>(m_int_str.size()) < int_zeros) m_int_str = "0" + m_int_str;
+        std::string m_int_str;
+        if (m_int != 0 || dc.int_zeros > 0 || (dc.int_hashes == 0 && dc.int_qmarks == 0 && total_frac == 0))
+            m_int_str = std::to_string(m_int);
+        if (static_cast<int>(m_int_str.size()) < dc.int_zeros)
+            m_int_str.insert(0, static_cast<size_t>(dc.int_zeros - static_cast<int>(m_int_str.size())), '0');
+        if (static_cast<int>(m_int_str.size()) < dc.int_zeros + dc.int_qmarks)
+            m_int_str.insert(0, static_cast<size_t>(dc.int_zeros + dc.int_qmarks - static_cast<int>(m_int_str.size())), ' ');
 
+        // Format mantissa fractional part
         std::string m_frac_str;
-        if (total_frac_digits > 0)
+        if (total_frac > 0)
         {
             const double m_frac = mantissa - m_int;
-            const int frac_val = static_cast<int>(std::round(m_frac * round_factor));
-            m_frac_str = std::to_string(frac_val);
-            while (static_cast<int>(m_frac_str.size()) < total_frac_digits) m_frac_str = "0" + m_frac_str;
-            const int min_frac = frac_zeros;
-            while (static_cast<int>(m_frac_str.size()) > min_frac && !m_frac_str.empty() && m_frac_str.back() == '0')
-                m_frac_str.pop_back();
+            const int fv = static_cast<int>(std::round(m_frac * round_factor));
+            m_frac_str = std::to_string(fv);
+            if (static_cast<int>(m_frac_str.size()) < total_frac)
+                m_frac_str.insert(0, static_cast<size_t>(total_frac - static_cast<int>(m_frac_str.size())), '0');
+            // Trim trailing zeros down to the minimum required by digit_zero
+            const int min_digits = (dc.frac_qmarks > 0) ? 0 : dc.frac_zeros;
+            while (static_cast<int>(m_frac_str.size()) > min_digits && !m_frac_str.empty() && m_frac_str.back() == '0')
+            {
+                const int idx = total_frac - static_cast<int>(m_frac_str.size());
+                if (idx >= dc.frac_zeros) m_frac_str.pop_back(); else break;
+            }
+            // Pad with spaces for ? placeholders (for decimal alignment)
+            if (dc.frac_qmarks > 0 && static_cast<int>(m_frac_str.size()) < total_frac)
+                m_frac_str.append(static_cast<size_t>(total_frac - static_cast<int>(m_frac_str.size())), ' ');
         }
 
-        std::string mantissa_result = m_int_str;
-        if (total_frac_digits > 0 && !m_frac_str.empty()) mantissa_result += "." + m_frac_str;
+        // If all placeholders are # (no 0) and the mantissa is zero, ensure at least "0" is shown.
+        if (m_int_str.empty() && m_frac_str.empty())
+            m_int_str = "0";
 
+        // Format exponent with leading zeros
         std::string exp_str = std::to_string(std::abs(exponent));
-        if (sci_tok.exp_digits > 0)
-            while (static_cast<int>(exp_str.size()) < sci_tok.exp_digits) exp_str = "0" + exp_str;
+        if (static_cast<int>(exp_str.size()) < sci_tok.exp_digits)
+            exp_str.insert(0, static_cast<size_t>(sci_tok.exp_digits - static_cast<int>(exp_str.size())), '0');
 
-        std::string sign;
-        if (exponent >= 0) { if (sci_tok.exp_plus_sign) sign = "+"; }
-        else sign = "-";
-
+        // Walk tokens to build output, preserving surrounding text (literals, skips, fills)
         std::string result;
-        result.reserve(mantissa_result.size() + exp_str.size() + sign.size() + 3);
+        result.reserve(m_int_str.size() + m_frac_str.size() + exp_str.size() + 16);
         if (negative && !neg_section_owns_sign) result += '-';
-        result += mantissa_result;
-        result += 'E';
-        result += sign;
-        result += exp_str;
+
+        bool int_output = false, frac_output = false;
+        bool past_decimal = false;
+
+        for (size_t i = 0; i < sec.tokens.size(); ++i)
+        {
+            const auto& tok = sec.tokens[i];
+            const auto tt = tok.type;
+
+            if (tt == token_type::literal) { result += tok.literal; continue; }
+            if (tt == token_type::skip)    { result += ' '; continue; }
+            if (tt == token_type::fill)    { result += tok.literal; continue; }
+            if (tt == token_type::percent) { result += '%'; continue; }
+
+            if (tt == token_type::decimal && static_cast<int>(i) < sci_pos)
+            {
+                if (!m_frac_str.empty()) result += '.';
+                past_decimal = true;
+                continue;
+            }
+
+            if (tt == token_type::scientific)
+            {
+                result += 'E';
+                if (exponent >= 0) { if (sci_tok.exp_plus_sign) result += '+'; }
+                else result += '-';
+                result += exp_str;
+                continue;
+            }
+
+            if (is_digit_token(tt))
+            {
+                if (static_cast<int>(i) < sci_pos)
+                {
+                    if (!past_decimal && !int_output) { result += m_int_str; int_output = true; }
+                    else if (past_decimal && !frac_output && !m_frac_str.empty()) { result += m_frac_str; frac_output = true; }
+                }
+            }
+        }
         return result;
     }
 
-    // ---- format: regular number section ----
+    // =========================================================================
+    // format: regular number section — standard numeric formatting
+    //
+    // Handles: digit placeholders (0, #, ?), decimal point, thousands separator,
+    // percent sign, and scale from trailing commas.
+    //
+    // Algorithm:
+    //   1. Scale and round the number to the specified precision
+    //   2. Format integer part (leading zeros, ? → space padding, thousands separators)
+    //   3. Format fraction part (trailing zero trimming, ? → space padding)
+    //   4. Walk tokens and interpolate the formatted parts
+    // =========================================================================
 
     std::string format_regular_number_section(const section& sec, double raw_value, bool neg_section_owns_sign, bool has_percent) const
     {
+        // Scale and handle sign
         double value = raw_value / sec.scale;
         const bool negative = value < 0;
         if (negative) value = -value;
         if (has_percent) value *= 100.0;
 
-        int int_zeros = 0, int_hashes = 0, int_qmarks = 0;
-        int frac_zeros = 0, frac_hashes = 0, frac_qmarks = 0;
-        bool past_decimal = false;
-        int thousands_count = 0;
+        // Analyze digit placeholders
+        const auto dc = count_digit_placeholders(sec);
+        const int total_frac = dc.total_frac();
 
-        for (auto& tok : sec.tokens)
-        {
-            if (tok.type == token_type::decimal) { past_decimal = true; continue; }
-            if (tok.type == token_type::percent || tok.type == token_type::scientific) continue;
-            if (tok.type == token_type::thousands) { if (!past_decimal) ++thousands_count; continue; }
-            if (!past_decimal)
-            {
-                if (tok.type == token_type::digit_zero)  int_zeros += tok.repeat;
-                else if (tok.type == token_type::digit_hash)  int_hashes += tok.repeat;
-                else if (tok.type == token_type::digit_qmark) int_qmarks += tok.repeat;
-            }
-            else
-            {
-                if (tok.type == token_type::digit_zero)  frac_zeros += tok.repeat;
-                else if (tok.type == token_type::digit_hash)  frac_hashes += tok.repeat;
-                else if (tok.type == token_type::digit_qmark) frac_qmarks += tok.repeat;
-            }
-        }
-
-        const int total_frac_digits = frac_zeros + frac_hashes + frac_qmarks;
-        const double round_factor = pow10[static_cast<size_t>(total_frac_digits)];
+        // Round to the specified precision
+        const double round_factor = pow10_safe(total_frac);
         value = std::round(value * round_factor) / round_factor;
 
+        // Split into integer and fraction parts
         long long int_part = static_cast<long long>(std::floor(value + 1e-12));
         long long frac_val = 0;
-        if (total_frac_digits > 0)
+        if (total_frac > 0)
         {
             const double frac = value - int_part;
             frac_val = static_cast<long long>(std::round(frac * round_factor));
+            // Handle rounding overflow (e.g., 0.999 → 1.000)
             if (frac_val >= static_cast<long long>(round_factor)) { ++int_part; frac_val = 0; }
         }
 
-        std::string int_str = std::to_string(std::llabs(int_part));
-        while (static_cast<int>(int_str.size()) < int_zeros) int_str = "0" + int_str;
+        // Format integer and fraction strings
+        std::string int_str = format_integer_str(int_part, dc, total_frac);
+        std::string frac_str = format_fraction_str(frac_val, total_frac, dc);
 
-        const bool use_thousands = (thousands_count > 0);
-        bool suppress_leading_zero = (int_zeros == 0 && int_hashes > 0 && int_part == 0 && total_frac_digits > 0);
-        if (suppress_leading_zero) int_str.clear();
-        else if (int_zeros == 0 && int_str == "0" && total_frac_digits == 0 && !use_thousands) int_str.clear();
-
-        if (use_thousands && int_str.size() > 3)
-        {
-            std::string with_commas;
-            const int len = static_cast<int>(int_str.size());
-            with_commas.reserve(len + len / 3);
-            for (int i = 0; i < len; ++i)
-            {
-                if (i > 0 && (len - i) % 3 == 0) with_commas += ',';
-                with_commas += int_str[i];
-            }
-            int_str = with_commas;
-        }
-
-        std::string frac_str;
-        if (total_frac_digits > 0)
-        {
-            frac_str = std::to_string(frac_val);
-            while (static_cast<int>(frac_str.size()) < total_frac_digits) frac_str = "0" + frac_str;
-            const int min_digits = (frac_qmarks > 0) ? 0 : frac_zeros;
-            while (static_cast<int>(frac_str.size()) > min_digits && !frac_str.empty() && frac_str.back() == '0')
-            {
-                const int idx = total_frac_digits - static_cast<int>(frac_str.size());
-                if (idx >= frac_zeros) frac_str.pop_back(); else break;
-            }
-            if (frac_qmarks > 0)
-                while (static_cast<int>(frac_str.size()) < total_frac_digits) frac_str += ' ';
-        }
-
+        // Walk tokens and assemble output
         std::string result;
         result.reserve(int_str.size() + frac_str.size() + 16);
         if (negative && !neg_section_owns_sign) result += '-';
 
-        int frac_pos = 0;
-        past_decimal = false;
+        bool past_decimal = false;
         bool int_output = false;
+        int frac_pos = 0;
 
         for (auto& tok : sec.tokens)
         {
@@ -1107,10 +1553,10 @@ struct number_format::impl
             case token_type::skip:    result += ' '; break;
             case token_type::fill:    result += tok.literal; break;
             case token_type::decimal:
-                if (total_frac_digits > 0 && (!frac_str.empty() || frac_zeros > 0)) result += '.';
+                if (total_frac > 0 && (!frac_str.empty() || dc.frac_zeros > 0)) result += '.';
                 past_decimal = true;
                 break;
-            case token_type::thousands: break;
+            case token_type::thousands: break; // handled by format_integer_str
             case token_type::percent: result += '%'; break;
             case token_type::digit_zero: case token_type::digit_hash: case token_type::digit_qmark:
                 if (!past_decimal)
@@ -1120,18 +1566,117 @@ struct number_format::impl
                 else
                 {
                     if (frac_pos < static_cast<int>(frac_str.size())) { result += frac_str[frac_pos]; ++frac_pos; }
-                    else if (tok.type == token_type::digit_qmark) result += ' ';
+                    else if (tok.type == token_type::digit_qmark) result += ' '; // ? → space
                 }
                 break;
             default: break;
             }
         }
+
+        // If the format had no digit tokens but the integer part is non-empty, prepend it
         if (!int_output && !int_str.empty())
         {
             const size_t ins = (negative && !result.empty() && result[0] == '-') ? 1 : 0;
             result.insert(ins, int_str);
         }
         return result;
+    }
+
+private:
+    // Count digit placeholders (0, #, ?) in a section, separated by the decimal point.
+    // If end_pos is specified, only counts tokens before that position.
+    static digit_counts count_digit_placeholders(const section& sec, int end_pos = -1) noexcept
+    {
+        if (end_pos < 0) end_pos = static_cast<int>(sec.tokens.size());
+
+        digit_counts dc;
+        bool past_decimal = false;
+
+        for (int i = 0; i < end_pos; ++i)
+        {
+            const auto tt = sec.tokens[i].type;
+            if (tt == token_type::decimal)       { past_decimal = true; continue; }
+            if (tt == token_type::percent || tt == token_type::scientific) continue;
+            if (tt == token_type::thousands)     { if (!past_decimal) ++dc.thousands; continue; }
+
+            if (!past_decimal)
+            {
+                if (tt == token_type::digit_zero)  dc.int_zeros  += sec.tokens[i].repeat;
+                else if (tt == token_type::digit_hash)  dc.int_hashes += sec.tokens[i].repeat;
+                else if (tt == token_type::digit_qmark) dc.int_qmarks += sec.tokens[i].repeat;
+            }
+            else
+            {
+                if (tt == token_type::digit_zero)  dc.frac_zeros  += sec.tokens[i].repeat;
+                else if (tt == token_type::digit_hash)  dc.frac_hashes += sec.tokens[i].repeat;
+                else if (tt == token_type::digit_qmark) dc.frac_qmarks += sec.tokens[i].repeat;
+            }
+        }
+        return dc;
+    }
+
+    // Format the integer part of a regular number.
+    // Handles: leading zero padding (0 placeholders), leading space padding
+    // (? placeholders for alignment), thousands separators, and zero suppression.
+    static std::string format_integer_str(long long int_part, const digit_counts& dc, int total_frac)
+    {
+        if (int_part == 0)
+        {
+            // Suppress leading zero when only # placeholders and fraction exists
+            if (dc.int_zeros == 0 && dc.int_hashes > 0 && total_frac > 0)
+                return {};
+            // Suppress a lone "0" when no zeros/qmarks required and no fraction/thousands
+            if (dc.int_zeros == 0 && dc.int_qmarks == 0 && total_frac == 0 && dc.thousands == 0)
+                return {};
+        }
+
+        std::string s = std::to_string(std::llabs(int_part));
+        if (static_cast<int>(s.size()) < dc.int_zeros)
+            s.insert(0, static_cast<size_t>(dc.int_zeros - static_cast<int>(s.size())), '0');
+
+        // Pad with spaces for ? placeholders only (# suppress, not pad)
+        if (static_cast<int>(s.size()) < dc.int_zeros + dc.int_qmarks)
+            s.insert(0, static_cast<size_t>(dc.int_zeros + dc.int_qmarks - static_cast<int>(s.size())), ' ');
+
+        // Insert thousands separators every 3 digits from the right
+        if (dc.thousands > 0 && s.size() > 3)
+        {
+            std::string with_commas;
+            const int len = static_cast<int>(s.size());
+            with_commas.reserve(len + len / 3);
+            for (int i = 0; i < len; ++i)
+            {
+                if (i > 0 && (len - i) % 3 == 0) with_commas += ',';
+                with_commas += s[i];
+            }
+            s = std::move(with_commas);
+        }
+        return s;
+    }
+
+    // Format the fraction part of a regular number.
+    // Handles: leading zero padding to match precision, trailing zero trimming
+    // (excess zeros beyond digit_zero requirements), and ? → space padding.
+    static std::string format_fraction_str(long long frac_val, int total_frac, const digit_counts& dc)
+    {
+        if (total_frac <= 0) return {};
+
+        std::string s = std::to_string(frac_val);
+        while (static_cast<int>(s.size()) < total_frac) s = "0" + s;
+
+        // Trim trailing zeros beyond the minimum required by digit_zero placeholders
+        const int min_digits = (dc.frac_qmarks > 0) ? 0 : dc.frac_zeros;
+        while (static_cast<int>(s.size()) > min_digits && !s.empty() && s.back() == '0')
+        {
+            const int idx = total_frac - static_cast<int>(s.size());
+            if (idx >= dc.frac_zeros) s.pop_back(); else break;
+        }
+
+        // Pad with spaces for ? placeholders (for decimal alignment)
+        if (dc.frac_qmarks > 0)
+            while (static_cast<int>(s.size()) < total_frac) s += ' ';
+
+        return s;
     }
 };
 
