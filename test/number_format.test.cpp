@@ -170,6 +170,13 @@ void test_number_format()
     test_case("0.##", 123.4, "123.4");
     test_case("0.##", 123, "123");
 
+    // Mixed 0 and #: # suppresses trailing zero at its position only
+    test_case("0.0#", 0.10, "0.1");
+    test_case("0.0#", 0.1, "0.1");
+    test_case("0.0#", 0.0, "0.0");
+    test_case("0.0##", 0.105, "0.105");
+    test_case("0.0##", 0.100, "0.1");
+
     // ==========================================================================
     // Digit Placeholder: ?
     // ECMA-376: ? follows 0 rules but uses space for insignificant zeros.
@@ -179,6 +186,12 @@ void test_number_format()
     test_case("?.??", 1.234, "1.23");
     test_case("0.??", 1.2, "1.2 ");
     test_case("??.??", 12.3, "12.3 ");
+
+    // ECMA-376: ? with zero value shows space for alignment, not empty
+    test_case("?", 0, " ");
+    test_case("??", 0, "  ");
+    test_case("#?", 0, " ");
+    test_case("?.?", 0, " . ");
 
     // ==========================================================================
     // Thousands Separator: ,
@@ -195,6 +208,11 @@ void test_number_format()
     test_case("#,##0.00", 1234.56, "1,234.56");
     test_case("#,##0.00", 1234567.89, "1,234,567.89");
     test_case("#,##0.00", -1234.56, "-1,234.56");
+
+    // Pure hash formats with thousands separator: zero is suppressed
+    test_case("#,###", 0, "");
+    test_case("#,###", 1234, "1,234");
+    test_case("#,#", 0, "");
 
     // ==========================================================================
     // Scaling by Thousands
@@ -356,6 +374,17 @@ void test_number_format()
     test_case("[h]:mm", 1.5, "36:00");
     test_case("[m]:ss", 1, "1440:00");
 
+    // Multi-char elapsed time: [hh], [hhh], etc.
+    test_case("[hh]:mm", 1.5, "36:00");
+    test_case("[hhh]", 1, "024");
+
+    // [h]mm resolves mm as minutes (not month) when preceded by elapsed hours
+    test_case("[h]mm", 1.5, "3600");
+    test_case("[h]:mm:ss", 1.5, "36:00:00");
+
+    // Large elapsed time: previously would overflow int
+    test_case("[s]", 100000, "8640000000");
+
     // ==========================================================================
     // Combined Date-Time
     // ECMA-376: Mix of date and time tokens in one format.
@@ -431,6 +460,9 @@ void test_number_format()
     test_text("\"[\"@\"]\"", "Test", "[Test]");
     test_text("\"Name: \"@\"!\"", "Bob", "Name: Bob!");
 
+    // Empty 4th section (text section) returns original text
+    test_text("0;0;0;", "Hello", "Hello");
+
     // ==========================================================================
     // Escaped Characters: \  ""
     // ECMA-376: \ escapes the next character; "" encloses literal strings.
@@ -481,6 +513,10 @@ void test_number_format()
     test_case("#,##0.00", -1234.56, "-1,234.56");
     test_case("0%", -0.5, "-50%");
     test_case("0.00E+00", -1234, "-1.23E+03");
+
+    // Lowercase e scientific notation (ECMA-376 allows both E and e)
+    test_case("0.00e+00", 12345.6789, "1.23e+04");
+    test_case("0.00e-00", 12345.6789, "1.23e04");
 
     // ==========================================================================
     // Edge Cases
