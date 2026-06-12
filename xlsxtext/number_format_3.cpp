@@ -16,6 +16,7 @@
 #include <charconv>
 #include <cmath>
 #include <cstdint>
+#include <numeric>
 #include <stdexcept>
 #include <vector>
 
@@ -82,33 +83,10 @@ namespace
         out.append(buf, r.ptr);
     }
 
-    void append_pad2(std::string& out, int val) noexcept
-    {
-        if (val < 10) out += '0';
-        char buf[8];
-        auto r = std::to_chars(buf, buf + 8, val);
-        out.append(buf, r.ptr);
-    }
-
-    // Append val with leading zeros to fill at least `width` characters.
-    // For negative values, no padding is applied (minimal guard).
-    void append_pad4(std::string& out, int val) noexcept
-    {
-        if (val >= 0)
-        {
-            if (val < 1000) out += '0';
-            if (val < 100)  out += '0';
-            if (val < 10)   out += '0';
-        }
-        char buf[16];
-        auto r = std::to_chars(buf, buf + 16, val);
-        out.append(buf, r.ptr);
-    }
-
     // Append val with leading zeros to fill at least `width` characters.
     void append_padded(std::string& out, int val, int width) noexcept
     {
-        char buf[16];
+        char buf[32];
         auto r = std::to_chars(buf, buf + sizeof(buf), val);
         const int len = static_cast<int>(r.ptr - buf);
         for (int k = len; k < width; ++k) out += '0';
@@ -116,14 +94,6 @@ namespace
     }
 
     // ---- date/time arithmetic (Howard Hinnant's civil calendar algorithms) ----
-
-    int compute_gcd(int a, int b) noexcept
-    {
-        while (b) { int t = b; b = a % b; a = t; }
-        return a;
-    }
-
-    // Convert civil date (y,m,d) to serial day number (days since 1970-01-01)
     int days_from_civil(int y, int m, int d) noexcept
     {
         y -= m <= 2;
@@ -203,33 +173,30 @@ namespace
         best_den = 1;
         double best_err = 1.0;
 
-        // Phase 1: try common denominators first (powers of 2, 10, 3, 5, etc.)
-        static constexpr int common_denoms[] = {2, 4, 8, 16, 32, 64, 10, 100, 3, 6, 12, 24, 48, 96, 5, 20, 50};
-        for (int d : common_denoms)
-        {
-            if (d > max_den) continue;
+        auto try_denom = [&](int d) {
+            if (d > max_den) return;
             const int n = static_cast<int>(std::round(frac * d));
-            if (n > d) continue;
+            if (n > d) return;
             const double err = std::fabs(frac - static_cast<double>(n) / d);
             if (err < best_err - 1e-12) { best_err = err; best_num = n; best_den = d; }
-        }
+        };
+
+        // Phase 1: try common denominators first (powers of 2, 10, 3, 5, etc.)
+        static constexpr int common_denoms[] = {
+            2, 3, 4, 5, 6, 8, 10, 12, 16, 20, 24, 25,
+            30, 32, 40, 48, 50, 60, 64, 80, 96, 100
+        };
+        for (int d : common_denoms) try_denom(d);
 
         // Phase 2: exhaustive search if no close match found
         if (best_err > 1e-6)
-        {
             for (int d = 1; d <= max_den; ++d)
-            {
-                const int n = static_cast<int>(std::round(frac * d));
-                if (n > d) continue;
-                const double err = std::fabs(frac - static_cast<double>(n) / d);
-                if (err < best_err - 1e-12) { best_err = err; best_num = n; best_den = d; }
-            }
-        }
+                try_denom(d);
 
         // Reduce fraction to lowest terms
         if (best_num > 0 && best_den > 1)
         {
-            const int g = compute_gcd(best_num, best_den);
+            const int g = std::gcd(best_num, best_den);
             if (g > 1) { best_num /= g; best_den /= g; }
         }
         if (best_num == best_den) { best_num = 0; best_den = 1; }
@@ -317,6 +284,7 @@ struct number_format::impl
         token_type type;
         int repeat;
         std::string lit;
+        bool consumed = false; // mark as consumed by detect_fraction_seconds
     };
 
     // A format section — divided by ';' in the format string.
@@ -359,7 +327,7 @@ struct number_format::impl
     {
         int slash_pos = -1;     // position of '/' token
         int space_pos = -1;     // position of space separator (indicates integer part exists)
-        int int_digits = 0;     // count of integer-placeholder tokens
+        digit_counts int_counts;  // detailed digit counts for integer part (0/#/? + thousands)
         int num_digits = 0;     // count of numerator-placeholder tokens
         int den_digits = 0;     // count of denominator-placeholder tokens
         int num_qmarks = 0;     // count of ? tokens in numerator (for space padding)
@@ -445,13 +413,14 @@ struct number_format::impl
 
         if (fmt.empty()) { is_general = true; return; }
 
-        // ECMA-376: "General" means no formatting
+        // ECMA-376: "General" (case-insensitive) means no formatting
+        if (fmt.size() == 7)
         {
-            std::string upper;
-            upper.reserve(fmt.size());
-            for (auto c : fmt)
-                upper += static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-            if (upper == "GENERAL") { is_general = true; return; }
+            is_general = true;
+            for (size_t i = 0; i < 7; ++i)
+                if (static_cast<char>(std::toupper(static_cast<unsigned char>(fmt[i]))) != "GENERAL"[i])
+                { is_general = false; break; }
+            if (is_general) return;
         }
 
         auto raw_sections = split_sections(fmt);
@@ -654,8 +623,8 @@ private:
                 }
             }
 
-            // ---- Scientific notation: E+ / E- followed by 0 digits ----
-            if ((c == 'E' || c == 'e') && pos + 1 < raw.size() &&
+            // ---- Scientific notation: E+ / E- followed by 0 digits (ECMA-376: capital E only) ----
+            if (c == 'E' && pos + 1 < raw.size() &&
                 (raw[pos + 1] == '+' || raw[pos + 1] == '-'))
             {
                 const bool plus = (raw[pos + 1] == '+');
@@ -668,11 +637,11 @@ private:
             }
 
             // ---- Date/time components (repeat counts determine type) ----
-            if (c == 'y' || c == 'Y')  // Year: yy → 2-digit, yyyy+ → 4-digit
+            if (c == 'y' || c == 'Y')  // Year: yy → 2-digit, yyy+ → 4-digit
             {
                 int n = 1;
                 while (pos + n < raw.size() && (raw[pos + n] == 'y' || raw[pos + n] == 'Y')) ++n;
-                tokens.push_back({n >= 4 ? token_type::year_4 : token_type::year_2, n, ""});
+                tokens.push_back({n >= 3 ? token_type::year_4 : token_type::year_2, n, ""});
                 pos += n; continue;
             }
             if (c == 'm' || c == 'M')  // Month (or Minute, resolved later): m, mm, mmm, mmmm, mmmmm+
@@ -751,7 +720,7 @@ private:
             }
             if (c >= '1' && c <= '9')
             {
-                tokens.push_back({token_type::digit_zero, 1, std::string(1, c)});
+                tokens.push_back({token_type::literal, 0, std::string(1, c)});
                 ++pos; continue;
             }
             if (c == '#')
@@ -769,8 +738,8 @@ private:
                 pos += n; continue;
             }
 
-            // ---- Characters that are literal without escaping ----
-            if (c == '(' || c == ')' || c == '-' || c == '+' || c == ' ')
+            // ---- Characters that are literal without escaping (§18.8.31) ----
+            if (c == '$' || c == '(' || c == ')' || c == '-' || c == '+' || c == ' ')
             {
                 tokens.push_back({token_type::literal, 0, std::string(1, c)});
                 ++pos; continue;
@@ -791,7 +760,8 @@ private:
         bool has_h = false, has_d = false, has_y = false;
         for (auto& rt : tokens)
         {
-            if (rt.type == token_type::hour_h || rt.type == token_type::hour_hh) has_h = true;
+            if (rt.type == token_type::hour_h || rt.type == token_type::hour_hh ||
+                rt.type == token_type::elapsed_hours) has_h = true;
             if (rt.type == token_type::day_d  || rt.type == token_type::day_dd ||
                 rt.type == token_type::day_ddd || rt.type == token_type::day_dddd) has_d = true;
             if (rt.type == token_type::year_2 || rt.type == token_type::year_4) has_y = true;
@@ -816,7 +786,7 @@ private:
 
     // Detect fractional seconds: ".000" immediately after "s" or "ss".
     // Converts the decimal token to frac_second and marks the following zeros
-    // as consumed (empty literal type, skipped by flatten_tokens).
+    // as consumed so flatten_tokens will skip them.
     static void detect_fraction_seconds(std::vector<raw_token>& tokens)
     {
         for (size_t i = 0; i < tokens.size(); ++i)
@@ -835,20 +805,39 @@ private:
             {
                 tokens[i].type = token_type::frac_second;
                 tokens[i].repeat = nz;
-                // Mark consumed zero tokens as empty literal so flatten_tokens skips them
+                // Mark consumed zero tokens so flatten_tokens skips them
                 for (size_t k = i + 1; k < j; ++k)
-                    { tokens[k].type = token_type::literal; tokens[k].lit.clear(); }
+                    tokens[k].consumed = true;
             }
         }
     }
 
     // Expand raw_tokens with repeat counts into individual tokens.
     // E.g., "000" (digit_zero, repeat=3) → 3 individual digit_zero tokens.
-    // Elapsed time and frac_second tokens propagate their repeat count for zero-padding.
+    // Tokens whose repeat count controls zero-padding width propagate it to the
+    // flattened token (year_4, hour_h/hh, minute_m/mm, second_s/ss, frac_second,
+    // elapsed_*).
+    static bool is_repeat_propagated(token_type tt) noexcept
+    {
+        switch (tt)
+        {
+        case token_type::frac_second:
+        case token_type::elapsed_hours: case token_type::elapsed_minutes:
+        case token_type::elapsed_seconds:
+        case token_type::year_4:
+        case token_type::hour_h:   case token_type::hour_hh:
+        case token_type::minute_m: case token_type::minute_mm:
+        case token_type::second_s: case token_type::second_ss:
+            return true;
+        default: return false;
+        }
+    }
+
     static void flatten_tokens(const std::vector<raw_token>& raw_tokens, std::vector<token>& out)
     {
         for (auto& rt : raw_tokens)
         {
+            if (rt.consumed) continue;
             if (rt.type == token_type::literal && rt.lit.empty()) continue;
 
             const int count = is_digit_token(rt.type) ? rt.repeat : 1;
@@ -856,13 +845,11 @@ private:
             {
                 token t;
                 t.type = rt.type;
-                t.repeat = (rt.type == token_type::frac_second ||
-                            rt.type == token_type::elapsed_hours ||
-                            rt.type == token_type::elapsed_minutes ||
-                            rt.type == token_type::elapsed_seconds) ? rt.repeat : 1;
+                t.repeat = is_repeat_propagated(rt.type) ? rt.repeat : 1;
 
                 if (rt.type == token_type::literal || rt.type == token_type::skip ||
                     rt.type == token_type::fill || rt.type == token_type::am_pm ||
+                    rt.type == token_type::text_placeholder ||
                     is_digit_token(rt.type))
                     t.literal = rt.lit;
                 if (rt.type == token_type::scientific)
@@ -937,14 +924,17 @@ public:
 private:
     static bool condition_matches(const section& sec, double number) noexcept
     {
+        // Scale epsilon relative to the condition value to handle both small
+        // and large thresholds correctly (e.g., [=1e-8] vs [=1e10]).
+        const double eps = float_epsilon * std::fmax(1.0, std::fabs(sec.condition_value));
         switch (sec.condition_op)
         {
-        case section::cond_gt: return number > sec.condition_value + float_epsilon;
-        case section::cond_ge: return number >= sec.condition_value - float_epsilon;
-        case section::cond_lt: return number < sec.condition_value - float_epsilon;
-        case section::cond_le: return number <= sec.condition_value + float_epsilon;
-        case section::cond_eq: return std::fabs(number - sec.condition_value) < float_epsilon;
-        case section::cond_ne: return std::fabs(number - sec.condition_value) >= float_epsilon;
+        case section::cond_gt: return number > sec.condition_value + eps;
+        case section::cond_ge: return number >= sec.condition_value - eps;
+        case section::cond_lt: return number < sec.condition_value - eps;
+        case section::cond_le: return number <= sec.condition_value + eps;
+        case section::cond_eq: return std::fabs(number - sec.condition_value) < eps;
+        case section::cond_ne: return std::fabs(number - sec.condition_value) >= eps;
         default: return false;
         }
     }
@@ -959,12 +949,19 @@ public:
         section_info info;
         for (size_t i = 0; i < sec.tokens.size(); ++i)
         {
-            const auto tt = sec.tokens[i].type;
+            const auto& tok = sec.tokens[i];
+            const auto tt = tok.type;
 
             if (is_digit_token(tt))
             {
                 info.has_digits = true;
-                // Detect fraction format: digit after "/" with a digit before it
+                if (!info.is_fraction)
+                    info.is_fraction = is_fraction_denominator(sec.tokens, i);
+            }
+            else if (tt == token_type::literal && tok.literal.size() == 1
+                     && tok.literal[0] >= '1' && tok.literal[0] <= '9')
+            {
+                info.has_digits = true;
                 if (!info.is_fraction)
                     info.is_fraction = is_fraction_denominator(sec.tokens, i);
             }
@@ -989,6 +986,19 @@ private:
         if (tokens[pos - 1].type != token_type::literal || tokens[pos - 1].literal != "/")
             return false;
         return is_digit_token(tokens[pos - 2].type);
+    }
+
+    // Append common tokens (literal, skip, fill) to the output.
+    // Returns true if the token was handled, false if the caller should process it.
+    static bool append_common_token(std::string& out, const token& tok) noexcept
+    {
+        switch (tok.type)
+        {
+        case token_type::literal: out += tok.literal; return true;
+        case token_type::skip:    out += ' '; return true;
+        case token_type::fill:    out += tok.literal; return true;
+        default: return false;
+        }
     }
 
 public:
@@ -1048,9 +1058,8 @@ private:
         std::string result;
         for (auto& tok : sec.tokens)
         {
-            if (tok.type == token_type::text_placeholder)   result += format_number_general(number);
-            else if (tok.type == token_type::literal)       result += tok.literal;
-            else if (tok.type == token_type::skip)          result += ' ';
+            if (tok.type == token_type::text_placeholder) result += format_number_general(number);
+            else append_common_token(result, tok);
         }
         return result;
     }
@@ -1078,8 +1087,7 @@ public:
         for (auto& tok : text_sec->tokens)
         {
             if (tok.type == token_type::text_placeholder) { result += text; has_placeholder = true; }
-            else if (tok.type == token_type::literal)       result += tok.literal;
-            else if (tok.type == token_type::skip)          result += ' ';
+            else append_common_token(result, tok);
         }
 
         // If no @ placeholder, check if the section is a pure template
@@ -1108,23 +1116,29 @@ public:
         {
             switch (tok.type)
             {
-            case token_type::year_2:      append_pad2(result, dp.year % 100); break;
-            case token_type::year_4:      append_pad4(result, dp.year); break;
+            case token_type::year_2:      append_padded(result, dp.year % 100, 2); break;
+            case token_type::year_4:      append_padded(result, dp.year, tok.repeat); break;
             case token_type::month_n:     append_int(result, dp.month); break;
-            case token_type::month_nn:    append_pad2(result, dp.month); break;
+            case token_type::month_nn:    append_padded(result, dp.month, 2); break;
             case token_type::month_mmm:   result += month_abbr[month_idx]; break;
             case token_type::month_mmmm:  result += month_names[month_idx]; break;
             case token_type::month_mmmmm: result += month_names[month_idx][0]; break;
             case token_type::day_d:       append_int(result, dp.day); break;
-            case token_type::day_dd:      append_pad2(result, dp.day); break;
+            case token_type::day_dd:      append_padded(result, dp.day, 2); break;
             case token_type::day_ddd:     result += day_abbr[static_cast<size_t>(dp.dow)]; break;
             case token_type::day_dddd:    result += day_names[static_cast<size_t>(dp.dow)]; break;
-            case token_type::hour_h:      format_hour(result, dp.hour, has_ampm, false); break;
-            case token_type::hour_hh:     format_hour(result, dp.hour, has_ampm, true); break;
-            case token_type::minute_m:    append_int(result, dp.minute); break;
-            case token_type::minute_mm:   append_pad2(result, dp.minute); break;
-            case token_type::second_s:    append_int(result, dp.second); break;
-            case token_type::second_ss:   append_pad2(result, dp.second); break;
+            case token_type::hour_h: {
+                const int h = has_ampm ? (dp.hour % 12 == 0 ? 12 : dp.hour % 12) : dp.hour;
+                append_padded(result, h, tok.repeat); break;
+            }
+            case token_type::hour_hh: {
+                const int h = has_ampm ? (dp.hour % 12 == 0 ? 12 : dp.hour % 12) : dp.hour;
+                append_padded(result, h, tok.repeat); break;
+            }
+            case token_type::minute_m:    append_padded(result, dp.minute, tok.repeat); break;
+            case token_type::minute_mm:   append_padded(result, dp.minute, tok.repeat); break;
+            case token_type::second_s:    append_padded(result, dp.second, tok.repeat); break;
+            case token_type::second_ss:   append_padded(result, dp.second, tok.repeat); break;
             case token_type::am_pm:       append_ampm(result, tok.literal, dp.hour >= 12); break;
             case token_type::frac_second: append_frac_second(result, dp.fsec, tok.repeat); break;
             case token_type::elapsed_hours:
@@ -1133,23 +1147,15 @@ public:
                 append_padded(result, static_cast<int>(std::floor(raw_value * 24 * 60)), tok.repeat); break;
             case token_type::elapsed_seconds:
                 append_padded(result, static_cast<int>(std::floor(raw_value * 24 * 3600)), tok.repeat); break;
-            case token_type::literal: result += tok.literal; break;
-            case token_type::skip:    result += ' '; break;
-            case token_type::fill:    result += tok.literal; break;
-            default: break;
+            default:
+                append_common_token(result, tok);
+                break;
             }
         }
         return result;
     }
 
 private:
-    // Format hour with optional 12-hour conversion and padding
-    static void format_hour(std::string& out, int hour, bool has_ampm, bool pad2) noexcept
-    {
-        int h = has_ampm ? (hour % 12 == 0 ? 12 : hour % 12) : hour;
-        if (pad2) append_pad2(out, h); else append_int(out, h);
-    }
-
     // Append AM/PM or A/P string, preserving the original case pattern
     static void append_ampm(std::string& out, const std::string& pattern, bool pm) noexcept
     {
@@ -1159,12 +1165,16 @@ private:
             out += pm ? (pattern[0] == 'A' ? "P" : "p") : (pattern[0] == 'A' ? "A" : "a");
     }
 
-    // Append fractional seconds with leading zeros and rounding
+    // Append fractional seconds with leading zeros and rounding.
+    // Clamping is used instead of carrying overflow to the seconds field because
+    // format_date_time_section processes tokens linearly and seconds have already
+    // been emitted. The clamp only triggers for floating-point edge cases (fsec
+    // extremely close to 1.0 due to accumulated double-precision error).
     static void append_frac_second(std::string& out, double fsec, int repeat) noexcept
     {
         const double pv = pow10_safe(repeat);
         int fv = static_cast<int>(std::round(fsec * pv));
-        if (fv >= static_cast<int>(pv)) fv = static_cast<int>(pv) - 1; // clamp to avoid overflow
+        if (fv >= static_cast<int>(pv)) fv = static_cast<int>(pv) - 1;
 
         char buf[16];
         auto r = std::to_chars(buf, buf + sizeof(buf), fv);
@@ -1195,36 +1205,18 @@ public:
 
     std::string format_fraction_section(const section& sec, double raw_value, bool neg_section_owns_sign, bool has_percent) const
     {
-        // Step 1: analyze the fraction layout from tokens
         const fraction_layout fl = analyze_fraction_layout(sec);
 
-        // Step 2: compute the fraction values
         double scaled = raw_value / sec.scale;
         const bool negative = scaled < 0;
         if (negative) scaled = -scaled;
         if (has_percent) scaled *= 100.0;
 
-        int int_part = static_cast<int>(std::floor(scaled));
-        const double frac_part = scaled - int_part;
+        long long int_part = static_cast<long long>(std::floor(scaled));
+        const double frac_part = scaled - static_cast<double>(int_part);
 
-        int max_den = static_cast<int>(pow10_safe(fl.den_digits)) - 1;
-        if (max_den < 1) max_den = 99;
-
-        // Check for fixed denominator (e.g., # ?/2, # ?/4, # ?/8)
-        int fixed_den = 0;
-        if (fl.slash_pos >= 0)
-        {
-            for (int i = fl.slash_pos + 1; i < static_cast<int>(sec.tokens.size()); ++i)
-            {
-                const auto& dt = sec.tokens[i];
-                if (!is_digit_token(dt.type)) break;
-                if (!dt.literal.empty() && dt.literal[0] >= '1' && dt.literal[0] <= '9')
-                    fixed_den = fixed_den * 10 + (dt.literal[0] - '0');
-                else
-                    fixed_den = fixed_den * 10; // '0' placeholder — digit position, not fixed
-            }
-        }
-
+        // Determine best fraction: fixed denominator or best approximation
+        int fixed_den = compute_fixed_denominator(sec, fl);
         int best_num, best_den;
         if (fixed_den > 0)
         {
@@ -1233,31 +1225,32 @@ public:
         }
         else
         {
+            int max_den = static_cast<int>(pow10_safe(fl.den_digits)) - 1;
+            if (max_den < 1) max_den = 99;
             best_fraction(frac_part, max_den, best_num, best_den);
         }
 
-        // If fraction rounds to 1, carry to integer part
         if (best_num == best_den) { ++int_part; best_num = 0; best_den = 1; }
-
         const bool no_fraction = (best_num == 0);
 
-        // Step 3: format the number strings with ? → space padding for alignment
-        const bool has_int = (fl.int_digits > 0);
+        // Format integer, numerator, and denominator strings
+        char int_buf[32];
+        auto r = std::to_chars(int_buf, int_buf + sizeof(int_buf), int_part);
+        std::string int_str = format_integer_str(std::string(int_buf, r.ptr), fl.int_counts, 0);
+        const bool int_suppressed = int_str.empty();
 
-        std::string int_str;
-        if (has_int || int_part > 0)
-            int_str = std::to_string(int_part);
-        if (static_cast<int>(int_str.size()) < fl.int_digits)
-            int_str.insert(0, static_cast<size_t>(fl.int_digits - static_cast<int>(int_str.size())), ' ');
+        std::string num_str, den_str;
+        if (!no_fraction)
+        {
+            num_str = std::to_string(best_num);
+            den_str = std::to_string(best_den);
+            if (static_cast<int>(num_str.size()) < fl.num_qmarks)
+                num_str.insert(0, static_cast<size_t>(fl.num_qmarks - static_cast<int>(num_str.size())), ' ');
+            if (static_cast<int>(den_str.size()) < fl.den_qmarks)
+                den_str.append(static_cast<size_t>(fl.den_qmarks - static_cast<int>(den_str.size())), ' ');
+        }
 
-        std::string num_str = std::to_string(best_num);
-        std::string den_str = std::to_string(best_den);
-        if (static_cast<int>(num_str.size()) < fl.num_qmarks)
-            num_str.insert(0, static_cast<size_t>(fl.num_qmarks - static_cast<int>(num_str.size())), ' ');
-        if (static_cast<int>(den_str.size()) < fl.den_qmarks)
-            den_str.append(static_cast<size_t>(fl.den_qmarks - static_cast<int>(den_str.size())), ' ');
-
-        // Step 4: walk tokens to build output, preserving surrounding text
+        // Walk tokens and assemble output
         std::string result;
         result.reserve(32);
         if (negative && !neg_section_owns_sign) result += '-';
@@ -1269,49 +1262,96 @@ public:
             const auto& tok = sec.tokens[i];
             const auto tt = tok.type;
 
-            // Literals, skips, and fills are output as-is
+            if (tt == token_type::thousands) continue; // handled by format_integer_str
+
             if (tt == token_type::literal)
             {
-                if (tok.literal == "/") { if (!no_fraction) result += '/'; continue; }
-                // Suppress the space separator between integer and fraction when no fraction is shown
-                if (no_fraction && fl.space_pos >= 0 && static_cast<int>(i) == fl.space_pos && tok.literal == " ")
+                if (tok.literal == "/")
+                {
+                    if (!no_fraction) result += '/';
                     continue;
-                result += tok.literal;
+                }
+                // Space separator between integer and fraction parts
+                if (fl.space_pos >= 0 && static_cast<int>(i) == fl.space_pos && tok.literal == " ")
+                {
+                    if (!no_fraction && !int_suppressed) result += ' ';
+                    continue;
+                }
+                // Literal digits 1-9 are fraction placeholders, not output as literals
+                if (tok.literal.size() == 1 && tok.literal[0] >= '1' && tok.literal[0] <= '9')
+                {
+                    append_frac_placeholder(result, i, fl, int_str, num_str, den_str,
+                                            no_fraction, int_output, num_output, den_output);
+                    continue;
+                }
+                append_common_token(result, tok);
                 continue;
             }
-            if (tt == token_type::skip) { result += ' '; continue; }
-            if (tt == token_type::fill) { result += tok.literal; continue; }
+            if (append_common_token(result, tok)) continue;
 
-            // Digit placeholders: substitute with the appropriate formatted value
             if (is_digit_token(tt))
-            {
-                const int idx = static_cast<int>(i);
-                if (idx > fl.slash_pos)
-                {
-                    // Denominator — suppress when no fraction
-                    if (!no_fraction && !den_output) { result += den_str; den_output = true; }
-                }
-                else if (fl.space_pos >= 0 && idx < fl.space_pos)
-                {
-                    // Integer part
-                    if (!int_output) { result += int_str; int_output = true; }
-                }
-                else
-                {
-                    // Numerator — suppress when no fraction
-                    if (!no_fraction && !num_output) { result += num_str; num_output = true; }
-                }
-            }
+                append_frac_placeholder(result, i, fl, int_str, num_str, den_str,
+                                        no_fraction, int_output, num_output, den_output);
         }
         return result;
     }
 
 private:
+    // Compute the fixed denominator from tokens after the '/' in a fraction format.
+    // Literal digits 1-9 contribute their value; placeholder digits (0, #, ?) add
+    // a factor of 10. E.g., "# ?/8" → 8, "# ?/20" → 20.
+    static int compute_fixed_denominator(const section& sec, const fraction_layout& fl) noexcept
+    {
+        if (fl.slash_pos < 0) return 0;
+        int den = 0;
+        for (int i = fl.slash_pos + 1; i < static_cast<int>(sec.tokens.size()); ++i)
+        {
+            const auto& dt = sec.tokens[i];
+            if (dt.type == token_type::literal && dt.literal.size() == 1
+                && dt.literal[0] >= '1' && dt.literal[0] <= '9')
+                den = den * 10 + (dt.literal[0] - '0');
+            else if (is_digit_token(dt.type))
+                den *= 10;
+            else
+                break;
+        }
+        return den;
+    }
+
+    // Append the appropriate fraction part (integer, numerator, or denominator)
+    // based on the token's position relative to the '/' and space separators.
+    static void append_frac_placeholder(std::string& result, size_t idx, const fraction_layout& fl,
+                                        const std::string& int_str, const std::string& num_str,
+                                        const std::string& den_str, bool no_fraction,
+                                        bool& int_output, bool& num_output, bool& den_output) noexcept
+    {
+        const int i = static_cast<int>(idx);
+        if (i > fl.slash_pos)
+        {
+            if (!no_fraction && !den_output) { result += den_str; den_output = true; }
+        }
+        else if (fl.space_pos >= 0 && i < fl.space_pos)
+        {
+            if (!int_output) { result += int_str; int_output = true; }
+        }
+        else
+        {
+            if (!no_fraction && !num_output) { result += num_str; num_output = true; }
+        }
+    }
+
     // Analyze the fraction layout from a flattened token vector.
     // Finds the '/' position, counts digit groups on each side,
     // and identifies the space separator that marks the integer part.
+    // Literal digits 1-9 are also counted as fraction digits (e.g., # ?/8).
     static fraction_layout analyze_fraction_layout(const section& sec) noexcept
     {
+        auto is_frac_digit = [](const token& tok) noexcept -> bool {
+            if (is_digit_token(tok.type)) return true;
+            return tok.type == token_type::literal && tok.literal.size() == 1
+                && tok.literal[0] >= '1' && tok.literal[0] <= '9';
+        };
+
         fraction_layout fl;
 
         // Find the '/' position
@@ -1324,9 +1364,9 @@ private:
         // Count denominator digits (after '/')
         for (int i = fl.slash_pos + 1; i < static_cast<int>(sec.tokens.size()); ++i)
         {
-            const auto tt = sec.tokens[i].type;
-            if (is_digit_token(tt))
-            { ++fl.den_digits; if (tt == token_type::digit_qmark) ++fl.den_qmarks; }
+            const auto& tok = sec.tokens[i];
+            if (is_frac_digit(tok))
+            { ++fl.den_digits; if (tok.type == token_type::digit_qmark) ++fl.den_qmarks; }
             else
                 break;
         }
@@ -1334,9 +1374,9 @@ private:
         // Count numerator digits (immediately before '/')
         for (int i = fl.slash_pos - 1; i >= 0; --i)
         {
-            const auto tt = sec.tokens[i].type;
-            if (is_digit_token(tt))
-            { ++fl.num_digits; if (tt == token_type::digit_qmark) ++fl.num_qmarks; }
+            const auto& tok = sec.tokens[i];
+            if (is_frac_digit(tok))
+            { ++fl.num_digits; if (tok.type == token_type::digit_qmark) ++fl.num_qmarks; }
             else
                 break;
         }
@@ -1348,11 +1388,16 @@ private:
             sec.tokens[sep_pos].literal == " ")
         {
             fl.space_pos = sep_pos;
-            // Count integer digits (before the space)
+            // Count integer part digit placeholders with full type breakdown
             for (int i = sep_pos - 1; i >= 0; --i)
             {
-                if (is_digit_token(sec.tokens[i].type))
-                    ++fl.int_digits;
+                const auto tt = sec.tokens[i].type;
+                if (tt == token_type::digit_zero)        ++fl.int_counts.int_zeros;
+                else if (tt == token_type::digit_hash)   ++fl.int_counts.int_hashes;
+                else if (tt == token_type::digit_qmark)  ++fl.int_counts.int_qmarks;
+                else if (tt == token_type::thousands)    ++fl.int_counts.thousands;
+                else if (is_frac_digit(sec.tokens[i]))
+                { /* literal 1-9 digit in integer part — treat as hash */ ++fl.int_counts.int_hashes; }
                 else
                     break;
             }
@@ -1409,7 +1454,7 @@ public:
         // Format mantissa integer part
         const int m_int = static_cast<int>(std::floor(mantissa));
         std::string m_int_str;
-        if (m_int != 0 || dc.int_zeros > 0 || (dc.int_hashes == 0 && dc.int_qmarks == 0 && total_frac == 0))
+        if (m_int != 0 || dc.int_zeros > 0 || dc.int_hashes > 0 || dc.int_qmarks > 0)
             m_int_str = std::to_string(m_int);
         if (static_cast<int>(m_int_str.size()) < dc.int_zeros)
             m_int_str.insert(0, static_cast<size_t>(dc.int_zeros - static_cast<int>(m_int_str.size())), '0');
@@ -1425,16 +1470,7 @@ public:
             m_frac_str = std::to_string(fv);
             if (static_cast<int>(m_frac_str.size()) < total_frac)
                 m_frac_str.insert(0, static_cast<size_t>(total_frac - static_cast<int>(m_frac_str.size())), '0');
-            // Trim trailing zeros down to the minimum required by digit_zero
-            const int min_digits = (dc.frac_qmarks > 0) ? 0 : dc.frac_zeros;
-            while (static_cast<int>(m_frac_str.size()) > min_digits && !m_frac_str.empty() && m_frac_str.back() == '0')
-            {
-                const int idx = total_frac - static_cast<int>(m_frac_str.size());
-                if (idx >= dc.frac_zeros) m_frac_str.pop_back(); else break;
-            }
-            // Pad with spaces for ? placeholders (for decimal alignment)
-            if (dc.frac_qmarks > 0 && static_cast<int>(m_frac_str.size()) < total_frac)
-                m_frac_str.append(static_cast<size_t>(total_frac - static_cast<int>(m_frac_str.size())), ' ');
+            trim_trailing_zeros_and_pad(m_frac_str, total_frac, dc);
         }
 
         // If all placeholders are # (no 0) and the mantissa is zero, ensure at least "0" is shown.
@@ -1459,9 +1495,7 @@ public:
             const auto& tok = sec.tokens[i];
             const auto tt = tok.type;
 
-            if (tt == token_type::literal) { result += tok.literal; continue; }
-            if (tt == token_type::skip)    { result += ' '; continue; }
-            if (tt == token_type::fill)    { result += tok.literal; continue; }
+            if (append_common_token(result, tok)) continue;
             if (tt == token_type::percent) { result += '%'; continue; }
 
             if (tt == token_type::decimal && static_cast<int>(i) < sci_pos)
@@ -1522,18 +1556,23 @@ public:
         value = std::round(value * round_factor) / round_factor;
 
         // Split into integer and fraction parts
-        long long int_part = static_cast<long long>(std::floor(value + 1e-12));
+        double int_part_d = std::floor(value + float_epsilon);
         long long frac_val = 0;
         if (total_frac > 0)
         {
-            const double frac = value - int_part;
+            const double frac = value - int_part_d;
             frac_val = static_cast<long long>(std::round(frac * round_factor));
             // Handle rounding overflow (e.g., 0.999 → 1.000)
-            if (frac_val >= static_cast<long long>(round_factor)) { ++int_part; frac_val = 0; }
+            if (frac_val >= static_cast<long long>(round_factor)) { int_part_d += 1.0; frac_val = 0; }
         }
 
+        // Format integer part as string (avoids long long overflow for large values)
+        char int_buf[64];
+        auto int_r = std::to_chars(int_buf, int_buf + sizeof(int_buf), int_part_d, std::chars_format::fixed, 0);
+        const std::string int_str_raw(int_buf, int_r.ptr);
+
         // Format integer and fraction strings
-        std::string int_str = format_integer_str(int_part, dc, total_frac);
+        std::string int_str = format_integer_str(int_str_raw, dc, total_frac);
         std::string frac_str = format_fraction_str(frac_val, total_frac, dc);
 
         // Walk tokens and assemble output
@@ -1549,9 +1588,9 @@ public:
         {
             switch (tok.type)
             {
-            case token_type::literal: result += tok.literal; break;
-            case token_type::skip:    result += ' '; break;
-            case token_type::fill:    result += tok.literal; break;
+            default:
+                if (append_common_token(result, tok)) break;
+                break;
             case token_type::decimal:
                 if (total_frac > 0 && (!frac_str.empty() || dc.frac_zeros > 0)) result += '.';
                 past_decimal = true;
@@ -1569,14 +1608,14 @@ public:
                     else if (tok.type == token_type::digit_qmark) result += ' '; // ? → space
                 }
                 break;
-            default: break;
             }
         }
 
         // If the format had no digit tokens but the integer part is non-empty, prepend it
         if (!int_output && !int_str.empty())
         {
-            const size_t ins = (negative && !result.empty() && result[0] == '-') ? 1 : 0;
+            // Insert after leading sign indicator: '-' (automatic) or '(' (negative-section-owned)
+            const size_t ins = (!result.empty() && (result[0] == '-' || result[0] == '(')) ? 1 : 0;
             result.insert(ins, int_str);
         }
         return result;
@@ -1618,9 +1657,9 @@ private:
     // Format the integer part of a regular number.
     // Handles: leading zero padding (0 placeholders), leading space padding
     // (? placeholders for alignment), thousands separators, and zero suppression.
-    static std::string format_integer_str(long long int_part, const digit_counts& dc, int total_frac)
+    static std::string format_integer_str(const std::string& int_str_raw, const digit_counts& dc, int total_frac)
     {
-        if (int_part == 0)
+        if (int_str_raw == "0")
         {
             // Suppress leading zero when only # placeholders and fraction exists
             if (dc.int_zeros == 0 && dc.int_hashes > 0 && total_frac > 0)
@@ -1630,7 +1669,7 @@ private:
                 return {};
         }
 
-        std::string s = std::to_string(std::llabs(int_part));
+        std::string s = int_str_raw;
         if (static_cast<int>(s.size()) < dc.int_zeros)
             s.insert(0, static_cast<size_t>(dc.int_zeros - static_cast<int>(s.size())), '0');
 
@@ -1654,6 +1693,20 @@ private:
         return s;
     }
 
+    // Trim trailing zeros beyond the minimum required by digit_zero placeholders,
+    // and pad with spaces for ? placeholders (for decimal alignment).
+    static void trim_trailing_zeros_and_pad(std::string& s, int total_frac, const digit_counts& dc) noexcept
+    {
+        const int min_digits = (dc.frac_qmarks > 0) ? 0 : dc.frac_zeros;
+        while (static_cast<int>(s.size()) > min_digits && !s.empty() && s.back() == '0')
+        {
+            const int idx = total_frac - static_cast<int>(s.size());
+            if (idx >= dc.frac_zeros) s.pop_back(); else break;
+        }
+        if (dc.frac_qmarks > 0 && static_cast<int>(s.size()) < total_frac)
+            s.append(static_cast<size_t>(total_frac - static_cast<int>(s.size())), ' ');
+    }
+
     // Format the fraction part of a regular number.
     // Handles: leading zero padding to match precision, trailing zero trimming
     // (excess zeros beyond digit_zero requirements), and ? → space padding.
@@ -1662,19 +1715,10 @@ private:
         if (total_frac <= 0) return {};
 
         std::string s = std::to_string(frac_val);
-        while (static_cast<int>(s.size()) < total_frac) s = "0" + s;
+        if (static_cast<int>(s.size()) < total_frac)
+            s.insert(0, static_cast<size_t>(total_frac - static_cast<int>(s.size())), '0');
 
-        // Trim trailing zeros beyond the minimum required by digit_zero placeholders
-        const int min_digits = (dc.frac_qmarks > 0) ? 0 : dc.frac_zeros;
-        while (static_cast<int>(s.size()) > min_digits && !s.empty() && s.back() == '0')
-        {
-            const int idx = total_frac - static_cast<int>(s.size());
-            if (idx >= dc.frac_zeros) s.pop_back(); else break;
-        }
-
-        // Pad with spaces for ? placeholders (for decimal alignment)
-        if (dc.frac_qmarks > 0)
-            while (static_cast<int>(s.size()) < total_frac) s += ' ';
+        trim_trailing_zeros_and_pad(s, total_frac, dc);
 
         return s;
     }
