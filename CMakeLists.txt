@@ -1,22 +1,17 @@
 cmake_minimum_required(VERSION 3.18)
-project(xlsxtext VERSION 1.0.0 LANGUAGES C CXX)
+project(xlsxtext VERSION 1.0.1 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# --- Library target (header-only) ---
-add_library(xlsxtext INTERFACE)
-target_include_directories(xlsxtext INTERFACE
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
+# --- Library target (static library with .cpp compilation units) ---
+add_library(xlsxtext STATIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/xlsxtext/miniz/miniz.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/xlsxtext/pugixml/pugixml.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/xlsxtext/number_format_3.cpp
 )
-target_sources(xlsxtext INTERFACE
-    ${CMAKE_CURRENT_SOURCE_DIR}/include/xlsxtext.hpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/include/number_format.hpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/include/miniz/miniz.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/include/miniz/miniz.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/include/pugixml/pugixml.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/include/pugixml/pugixml.hpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/include/pugixml/pugiconfig.hpp
+target_include_directories(xlsxtext PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/xlsxtext
 )
 
 # --- Demo / integration test target ---

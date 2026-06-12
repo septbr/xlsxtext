@@ -2,7 +2,7 @@
 
 #include "miniz/miniz.h"
 #include "pugixml/pugixml.hpp"
-#include "number_format.hpp"
+#include "number_format_3.hpp"
 
 #include <cstring>
 #include <string>
@@ -93,7 +93,7 @@ namespace xlsxtext
              {10, "0.00%"},
              {11, "0.00E+00"},
              {12, "# ?/?"},
-             {13, "# ?\?/??"},
+             {13, "# ??/??"},
              {14, "mm-dd-yy"},
              {15, "d-mmm-yy"},
              {16, "d-mmm"},
