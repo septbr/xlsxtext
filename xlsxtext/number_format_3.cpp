@@ -136,6 +136,14 @@ namespace
         y += (m <= 2);
     }
 
+    // Compute day-of-week from civil date (0=Sunday .. 6=Saturday).
+    // Uses days_from_civil: 1970-01-01 (Thursday, dow=4) maps to day 0.
+    inline int calc_dow(int y, int m, int d) noexcept
+    {
+        const int v = days_from_civil(y, m, d) + 4;
+        return v >= 0 ? v % 7 : (v % 7 + 7) % 7;
+    }
+
     // Convert Excel serial date number to date_parts.
     // Handles the 1900 leap-year bug (serial 60 = Feb 29, 1900).
     // Supports both 1900 and 1904 date systems.
@@ -147,7 +155,7 @@ namespace
         // ECMA-376: 1900 date system treats serial 60 as 1900-02-29 (leap year bug)
         if (!date1904 && whole == 60)
         {
-            const int dow = (whole + 6) % 7;
+            const int dow = calc_dow(1900, 2, 29);
             const double total_seconds = frac * 86400.0;
             const int hour = static_cast<int>(total_seconds) / 3600;
             const int minute = (static_cast<int>(total_seconds) % 3600) / 60;
@@ -169,8 +177,8 @@ namespace
         int y, m, d;
         civil_from_days(epoch_days + real_days, y, m, d);
 
-        // dow = (serial + 6) mod 7: Excel 1900 epoch (1899-12-31) is Sunday (dow=0)
-        const int dow = (whole + 6) % 7;
+        // Compute dow from the actual civil date — correct for all serials and both date systems
+        const int dow = calc_dow(y, m, d);
         const double total_seconds = frac * 86400.0;
         const int hour = static_cast<int>(total_seconds) / 3600;
         const int minute = (static_cast<int>(total_seconds) % 3600) / 60;
@@ -315,6 +323,7 @@ struct number_format::impl
         int frac_zeros = 0, frac_hashes = 0, frac_qmarks = 0;
         int thousands = 0;
         std::string int_pattern;   // e.g. "##0", "0#?", "??#"
+        std::string frac_pattern;  // e.g. "00", "0#?", "0?"
         int total_frac() const noexcept { return frac_zeros + frac_hashes + frac_qmarks; }
         int total_int() const noexcept { return int_zeros + int_hashes + int_qmarks; }
     };
@@ -423,14 +432,26 @@ struct number_format::impl
 
         if (fmt.empty()) { is_general = true; return; }
 
-        // ECMA-376: "General" (case-insensitive) means no formatting
-        if (fmt.size() == 7)
+        // ECMA-376: "General" (case-insensitive) means no formatting.
+        // Strip leading bracket expressions (color, condition, locale) before checking.
+        // E.g., "General", "[Red]General", "[$USD-409]General", "[>10]General" all → General.
         {
-            is_general = true;
-            for (size_t i = 0; i < 7; ++i)
-                if (static_cast<char>(std::toupper(static_cast<unsigned char>(fmt[i]))) != "GENERAL"[i])
-                { is_general = false; break; }
-            if (is_general) return;
+            size_t pos = 0;
+            while (pos < fmt.size() && fmt[pos] == '[')
+            {
+                const size_t end = fmt.find(']', pos);
+                if (end == std::string::npos) break;
+                pos = end + 1;
+            }
+            const std::string body = fmt.substr(pos);
+            if (body.size() == 7)
+            {
+                bool match = true;
+                for (size_t i = 0; i < 7; ++i)
+                    if (static_cast<char>(std::toupper(static_cast<unsigned char>(body[i]))) != "GENERAL"[i])
+                    { match = false; break; }
+                if (match) { is_general = true; return; }
+            }
         }
 
         auto raw_sections = split_sections(fmt);
@@ -486,11 +507,22 @@ private:
         sec.section_type = section_index;
         size_t pos = 0;
 
-        parse_bracket(raw, pos, sec, condition_count);
+        // Consume all prefix brackets: conditions, colors, locales.
+        // Elapsed time brackets are NOT consumed here — they're inline tokens
+        // handled by tokenize_section below.
+        while (pos < raw.size() && raw[pos] == '[')
+        {
+            const size_t end = raw.find(']', pos);
+            if (end == std::string::npos) break;
+            const std::string inner = raw.substr(pos + 1, end - pos - 1);
+            if (is_elapsed_bracket(inner) != '\0') break;
+            parse_bracket(raw, pos, sec, condition_count);
+        }
         auto raw_tokens = tokenize_section(raw, pos);
         resolve_mm_ambiguity(raw_tokens);
         detect_fraction_seconds(raw_tokens);
         flatten_tokens(raw_tokens, sec.tokens);
+        suppress_extra_fill_tokens(sec.tokens);
         sec.scale = compute_scale(sec.tokens);
         return sec;
     }
@@ -612,7 +644,7 @@ private:
                 }
             }
 
-            // ---- Scientific notation: E+/E-/e+/e- followed by 0 digits (ECMA-376: E or e) ----
+            // ---- Scientific notation: E+/E-/e+/e- followed by digit placeholders (ECMA-376: E or e) ----
             if ((c == 'E' || c == 'e') && pos + 1 < raw.size() &&
                 (raw[pos + 1] == '+' || raw[pos + 1] == '-'))
             {
@@ -620,7 +652,7 @@ private:
                 const bool upper = (c == 'E');
                 pos += 2;
                 int ed = 0;
-                while (pos < raw.size() && raw[pos] == '0') { ++ed; ++pos; }
+                while (pos < raw.size() && (raw[pos] == '0' || raw[pos] == '#' || raw[pos] == '?')) { ++ed; ++pos; }
                 if (ed == 0) ed = 1; // default: at least 1 digit
                 tokens.push_back({token_type::scientific, ed, std::string(1, upper ? 'E' : 'e') + (plus ? "+" : "-")});
                 continue;
@@ -786,7 +818,10 @@ private:
             if (tokens[i].type != token_type::decimal) continue;
             if (i == 0) continue;
             const auto prev = tokens[i - 1].type;
-            if (prev != token_type::second_s && prev != token_type::second_ss) continue;
+            if (prev != token_type::second_s && prev != token_type::second_ss
+                && prev != token_type::elapsed_seconds
+                && prev != token_type::elapsed_hours
+                && prev != token_type::elapsed_minutes) continue;
 
             int nz = 0;
             size_t j = i + 1;
@@ -864,6 +899,25 @@ private:
         }
     }
 
+    // ECMA-376: "If more than one asterisk appears in one section of the
+    // format, all but the last asterisk shall be ignored."
+    // Convert all but the last fill token to literal tokens with the fill char.
+    static void suppress_extra_fill_tokens(std::vector<token>& tokens) noexcept
+    {
+        int last_fill = -1;
+        for (size_t i = 0; i < tokens.size(); ++i)
+            if (tokens[i].type == token_type::fill) last_fill = static_cast<int>(i);
+
+        for (size_t i = 0; i < tokens.size(); ++i)
+        {
+            if (tokens[i].type == token_type::fill && static_cast<int>(i) != last_fill)
+            {
+                tokens[i].type = token_type::literal;
+                // Emit the fill character as a literal (repeated once, not filling)
+            }
+        }
+    }
+
     // Compute the scale divisor from trailing commas.
     // ECMA-376: each comma after the last digit placeholder divides by 1000.
     // E.g., "#,##0,," → scale = 1,000,000
@@ -917,6 +971,8 @@ public:
             // No condition matched → fall back to first unconditional section
             for (auto& sec : sections)
                 if (!sec.has_condition) return &sec;
+            // ECMA-376: all sections have conditions but none matched
+            return nullptr;
         }
 
         // Step 2: standard positive/negative/zero selection
@@ -1023,7 +1079,9 @@ public:
             return format_number_general(number);
 
         const section* sec = select_section(number);
-        if (!sec) return format_number_general(number);
+        // ECMA-376: "If the cell value does not meet any of the criteria, then
+        // pound signs ("#") are displayed across the width of the cell."
+        if (!sec) return std::string(default_cell_width, '#');
 
         const section_info info = analyze_section(*sec);
 
@@ -1122,6 +1180,9 @@ public:
         const date_parts dp = serial_to_date(raw_value, date1904);
         const size_t month_idx = static_cast<size_t>(dp.month) - 1;
 
+        // Fractional seconds value — may be overridden by elapsed_seconds below
+        double frac_sec = dp.fsec;
+
         std::string result;
         result.reserve(sec.tokens.size() * 4);
 
@@ -1150,15 +1211,41 @@ public:
             case token_type::second_s:
             case token_type::second_ss:   append_padded(result, dp.second, tok.repeat); break;
             case token_type::am_pm:       append_ampm(result, tok.literal, dp.hour >= 12); break;
-            case token_type::frac_second: append_frac_second(result, dp.fsec, tok.repeat); break;
-            case token_type::elapsed_hours:
-                append_padded(result, static_cast<long long>(std::floor(raw_value * 24)), tok.repeat); break;
-            case token_type::elapsed_minutes:
-                append_padded(result, static_cast<long long>(std::floor(raw_value * 24 * 60)), tok.repeat); break;
-            case token_type::elapsed_seconds:
-                append_padded(result, static_cast<long long>(std::floor(raw_value * 24 * 3600)), tok.repeat); break;
+            case token_type::frac_second: append_frac_second(result, frac_sec, tok.repeat); break;
+            case token_type::elapsed_hours: {
+                const double total_hrs = raw_value * 24;
+                append_padded(result, static_cast<long long>(std::floor(total_hrs)), tok.repeat);
+                frac_sec = total_hrs - std::floor(total_hrs);
+                break;
+            }
+            case token_type::elapsed_minutes: {
+                const double total_mins = raw_value * 24 * 60;
+                append_padded(result, static_cast<long long>(std::floor(total_mins)), tok.repeat);
+                frac_sec = total_mins - std::floor(total_mins);
+                break;
+            }
+            case token_type::elapsed_seconds: {
+                const double total_secs = raw_value * 24 * 3600;
+                append_padded(result, static_cast<long long>(std::floor(total_secs)), tok.repeat);
+                frac_sec = total_secs - std::floor(total_secs);
+                break;
+            }
             default:
-                append_common_token(result, tok);
+                if (!append_common_token(result, tok))
+                {
+                    // Output non-date tokens as their literal text equivalents
+                    switch (tok.type)
+                    {
+                    case token_type::percent:  result += '%'; break;
+                    case token_type::thousands: result += ','; break;
+                    case token_type::decimal:  result += '.'; break;
+                    case token_type::digit_zero:  result += '0'; break;
+                    case token_type::digit_hash:  result += '#'; break;
+                    case token_type::digit_qmark: result += '?'; break;
+                    case token_type::text_placeholder: result += '@'; break;
+                    default: break;
+                    }
+                }
                 break;
             }
         }
@@ -1248,7 +1335,7 @@ public:
         // Format integer part via std::to_chars on double (avoids long long overflow)
         char int_buf[64];
         auto r = std::to_chars(int_buf, int_buf + sizeof(int_buf), int_part_d, std::chars_format::fixed, 0);
-        std::string int_str = format_integer_str(std::string(int_buf, r.ptr), fl.int_counts, 0);
+        std::string int_str = format_integer_str(std::string(int_buf, r.ptr), fl.int_counts);
         bool int_suppressed = int_str.empty();
 
         // When the fraction part is zero, the integer must always be shown.
@@ -1453,13 +1540,18 @@ public:
             if (sec.tokens[i].type == token_type::scientific) { sci_tok = sec.tokens[i]; sci_pos = static_cast<int>(i); break; }
         }
 
-        // Compute mantissa and exponent
+        // Compute mantissa and exponent.
+        // Use log10 and then correct for floating-point precision (e.g.,
+        // log10(1000.0) may yield 2.999999... instead of 3.0).
         int exponent = 0;
         double mantissa = value;
         if (mantissa != 0.0)
         {
             exponent = static_cast<int>(std::floor(std::log10(mantissa)));
             mantissa = mantissa / pow10_safe(exponent);
+            // Correct if mantissa drifted out of [1, 10) due to fp error
+            if (mantissa < 1.0 - 1e-12) { mantissa *= 10.0; --exponent; }
+            else if (mantissa >= 10.0 - 1e-12) { mantissa /= 10.0; ++exponent; }
         }
 
         // Count digit placeholders up to the E token for precision
@@ -1473,16 +1565,7 @@ public:
 
         // Format mantissa integer part
         const int m_int = static_cast<int>(std::floor(mantissa));
-        std::string m_int_str;
-        if (m_int != 0 || dc.int_zeros > 0)
-            m_int_str = std::to_string(m_int);
-        else if (dc.int_qmarks > 0)
-            m_int_str = std::string(dc.int_qmarks, ' ');
-        // else if only #: keep empty — # suppresses zero
-        if (static_cast<int>(m_int_str.size()) < dc.int_zeros)
-            m_int_str.insert(0, static_cast<size_t>(dc.int_zeros - static_cast<int>(m_int_str.size())), '0');
-        if (static_cast<int>(m_int_str.size()) < dc.int_zeros + dc.int_qmarks)
-            m_int_str.insert(0, static_cast<size_t>(dc.int_zeros + dc.int_qmarks - static_cast<int>(m_int_str.size())), ' ');
+        std::string m_int_str = format_integer_str(std::to_string(m_int), dc);
 
         // Format mantissa fractional part
         std::string m_frac_str;
@@ -1493,7 +1576,7 @@ public:
             m_frac_str = std::to_string(fv);
             if (static_cast<int>(m_frac_str.size()) < total_frac)
                 m_frac_str.insert(0, static_cast<size_t>(total_frac - static_cast<int>(m_frac_str.size())), '0');
-            trim_trailing_zeros_and_pad(m_frac_str, total_frac, dc);
+            trim_trailing_zeros(m_frac_str, dc);
         }
 
         // If all placeholders are # (no 0) and the mantissa is zero, ensure at least "0" is shown.
@@ -1523,7 +1606,7 @@ public:
 
             if (tt == token_type::decimal && static_cast<int>(i) < sci_pos)
             {
-                if (total_frac > 0 && (!m_frac_str.empty() || dc.frac_zeros > 0)) result += '.';
+                result += '.';
                 past_decimal = true;
                 continue;
             }
@@ -1595,8 +1678,8 @@ public:
         const std::string int_str_raw(int_buf, int_r.ptr);
 
         // Format integer and fraction strings
-        std::string int_str = format_integer_str(int_str_raw, dc, total_frac);
-        std::string frac_str = format_fraction_str(frac_val, total_frac, dc);
+        std::string int_str = format_integer_str(int_str_raw, dc);
+        std::string frac_str = format_decimal_str(frac_val, total_frac, dc);
 
         // Walk tokens and assemble output
         std::string result;
@@ -1615,11 +1698,13 @@ public:
                 if (append_common_token(result, tok)) break;
                 break;
             case token_type::decimal:
-                if (total_frac > 0 && (!frac_str.empty() || dc.frac_zeros > 0)) result += '.';
+                // ECMA-376: the decimal point always appears in output when present
+                result += '.';
                 past_decimal = true;
                 break;
             case token_type::thousands: break; // handled by format_integer_str
             case token_type::percent: result += '%'; break;
+            case token_type::text_placeholder: result += '@'; break;
             case token_type::digit_zero: case token_type::digit_hash: case token_type::digit_qmark:
                 if (!past_decimal)
                 {
@@ -1671,9 +1756,9 @@ private:
             }
             else
             {
-                if (tt == token_type::digit_zero)  ++dc.frac_zeros;
-                else if (tt == token_type::digit_hash)  ++dc.frac_hashes;
-                else if (tt == token_type::digit_qmark) ++dc.frac_qmarks;
+                if (tt == token_type::digit_zero)       { ++dc.frac_zeros;  dc.frac_pattern += '0'; }
+                else if (tt == token_type::digit_hash)  { ++dc.frac_hashes; dc.frac_pattern += '#'; }
+                else if (tt == token_type::digit_qmark) { ++dc.frac_qmarks; dc.frac_pattern += '?'; }
             }
         }
         return dc;
@@ -1684,14 +1769,15 @@ private:
     // (# placeholders), space padding (? placeholders), thousands separators,
     // and zero suppression.
     //
-    // Uses dc.int_pattern to know the L-to-R order of '0','#','?' so that
-    // "0#" pads to "05" while "#0" pads to "5" for the value 5.
-    static std::string format_integer_str(const std::string& int_str_raw, const digit_counts& dc, int total_frac)
+    // Algorithm: pad the string to total_int, then walk the pattern L-to-R.
+    // Before the first non-zero digit: '0'→'0', '#'→skip, '?'→' '.
+    // At/after the first non-zero digit: output the actual digit.
+    // This directly builds the correct output without fragile space-marking.
+    static std::string format_integer_str(const std::string& int_str_raw, const digit_counts& dc)
     {
+        // Handle zero value with no mandatory zero placeholders
         if (int_str_raw == "0")
         {
-            // Suppress zero only when there are explicit # or ? placeholders
-            // and no 0 placeholders forcing the zero to be shown.
             if (dc.int_zeros == 0 && (dc.int_hashes > 0 || dc.int_qmarks > 0))
             {
                 if (dc.int_qmarks > 0)
@@ -1701,46 +1787,35 @@ private:
         }
 
         const int total = dc.total_int();
-        std::string s = int_str_raw;
+        std::string padded = int_str_raw;
 
         // Pad to the total number of integer placeholders
-        if (static_cast<int>(s.size()) < total)
-            s.insert(0, static_cast<size_t>(total - static_cast<int>(s.size())), '0');
+        if (static_cast<int>(padded.size()) < total)
+            padded.insert(0, static_cast<size_t>(total - static_cast<int>(padded.size())), '0');
 
-        // Apply # suppression (trim leading zeros at # positions) and
-        // ? → space replacement, using the L-to-R pattern
-        if (!dc.int_pattern.empty())
+        // Find the first non-zero digit. If all zeros, treat all as "before".
+        int first_nonzero = -1;
+        for (size_t i = 0; i < padded.size(); ++i)
+            if (padded[i] != '0') { first_nonzero = static_cast<int>(i); break; }
+        if (first_nonzero < 0) first_nonzero = static_cast<int>(padded.size());
+
+        // Build output directly from the pattern
+        std::string result;
+        result.reserve(padded.size() + dc.thousands);
+        for (size_t i = 0; i < padded.size(); ++i)
         {
-            for (size_t i = 0; i < dc.int_pattern.size() && i < s.size(); ++i)
-            {
-                if (s[i] == '0')
-                {
-                    if (dc.int_pattern[i] == '#')
-                        s[i] = ' ';  // mark for later trim
-                    else if (dc.int_pattern[i] == '?')
-                        s[i] = ' ';
-                }
-                else break; // non-zero digit: stop suppressing
-            }
-            // Strip leading spaces (from # suppression) but keep trailing ones (from ?)
-            size_t lead = 0;
-            while (lead < s.size() && s[lead] == ' ')
-            {
-                // Only strip if this position is a # (not a ?)
-                if (lead < dc.int_pattern.size() && dc.int_pattern[lead] == '#')
-                    ++lead;
-                else break;
-            }
-            if (lead > 0) s.erase(0, lead);
+            const bool before = (static_cast<int>(i) < first_nonzero);
+            const char pat = (i < dc.int_pattern.size()) ? dc.int_pattern[i] : '0';
 
-            // Strip trailing spaces from # positions (but keep ? spaces for alignment)
-            while (!s.empty() && s.back() == ' ')
+            if (before)
             {
-                const size_t idx = s.size() - 1;
-                if (idx < dc.int_pattern.size() && dc.int_pattern[idx] == '#')
-                    s.pop_back();
-                else
-                    break;
+                if (pat == '#') continue;          // suppress
+                if (pat == '?') result += ' ';      // space for alignment
+                else result += '0';                  // '0' placeholder
+            }
+            else
+            {
+                result += padded[i];
             }
         }
 
@@ -1748,17 +1823,16 @@ private:
         // Only count actual digit characters (not spaces from ? padding).
         if (dc.thousands > 0)
         {
-            // Count digits from the right
             int digit_count = 0;
-            for (auto it = s.rbegin(); it != s.rend(); ++it)
+            for (auto it = result.rbegin(); it != result.rend(); ++it)
                 if (*it >= '0' && *it <= '9') ++digit_count;
 
             if (digit_count > 3)
             {
                 std::string with_commas;
-                with_commas.reserve(s.size() + digit_count / 3);
+                with_commas.reserve(result.size() + digit_count / 3);
                 int seen = 0;
-                for (auto it = s.rbegin(); it != s.rend(); ++it)
+                for (auto it = result.rbegin(); it != result.rend(); ++it)
                 {
                     if (*it >= '0' && *it <= '9')
                     {
@@ -1768,40 +1842,57 @@ private:
                     with_commas += *it;
                 }
                 std::reverse(with_commas.begin(), with_commas.end());
-                s = std::move(with_commas);
+                result = std::move(with_commas);
             }
         }
-        return s;
+        return result;
     }
 
-    // Trim trailing zeros beyond the minimum required by digit_zero placeholders,
-    // and pad with spaces for ? placeholders (for decimal alignment).
-    static void trim_trailing_zeros_and_pad(std::string& s, int total_frac, const digit_counts& dc) noexcept
+    // Trim trailing zeros beyond the minimum required by digit_zero placeholders.
+    // Positions beyond the rightmost kept digit are handled by the token walker:
+    //   ? → space, # → nothing, 0 → 0.
+    static void trim_trailing_zeros(std::string& s, const digit_counts& dc) noexcept
     {
-        const int min_digits = (dc.frac_qmarks > 0) ? 0 : dc.frac_zeros;
-        while (static_cast<int>(s.size()) > min_digits && !s.empty() && s.back() == '0')
-        {
-            // Only trim zeros at positions beyond the mandatory zero placeholders.
-            // Position (0-indexed from left) must be >= dc.frac_zeros to be trimmable.
-            if (static_cast<int>(s.size()) > dc.frac_zeros) s.pop_back(); else break;
-        }
-        if (dc.frac_qmarks > 0 && static_cast<int>(s.size()) < total_frac)
-            s.append(static_cast<size_t>(total_frac - static_cast<int>(s.size())), ' ');
+        while (static_cast<int>(s.size()) > dc.frac_zeros && !s.empty() && s.back() == '0')
+            s.pop_back();
     }
 
-    // Format the fraction part of a regular number.
-    // Handles: leading zero padding to match precision, trailing zero trimming
-    // (excess zeros beyond digit_zero requirements), and ? → space padding.
-    static std::string format_fraction_str(long long frac_val, int total_frac, const digit_counts& dc)
+    // Format the decimal part of a regular number.
+    // Uses frac_pattern to correctly distinguish 0/#/? positions:
+    //   0 → always show digit (or 0)
+    //   # → show digit, suppress trailing zeros
+    //   ? → show digit, replace trailing zeros with space
+    static std::string format_decimal_str(long long frac_val, int total_frac, const digit_counts& dc)
     {
         if (total_frac <= 0) return {};
 
+        // Convert to zero-padded string of length total_frac
         std::string s = std::to_string(frac_val);
         if (static_cast<int>(s.size()) < total_frac)
             s.insert(0, static_cast<size_t>(total_frac - static_cast<int>(s.size())), '0');
 
-        trim_trailing_zeros_and_pad(s, total_frac, dc);
+        // If we have a fraction pattern, walk it to find the rightmost position
+        // that must be kept (0 placeholder or non-zero digit).
+        if (!dc.frac_pattern.empty())
+        {
+            int last_keep = -1;
+            for (int i = static_cast<int>(s.size()) - 1; i >= 0; --i)
+            {
+                const char pat = (i < static_cast<int>(dc.frac_pattern.size()))
+                    ? dc.frac_pattern[i] : '0';
+                if (pat == '0' || s[i] != '0') { last_keep = i; break; }
+            }
+            if (last_keep < 0) return {}; // all zeros, all #/? — nothing to show
 
+            std::string result;
+            result.reserve(static_cast<size_t>(last_keep) + 1);
+            for (int i = 0; i <= last_keep; ++i)
+                result += s[i];
+            return result;
+        }
+
+        // Fallback: no pattern available (shouldn't happen)
+        trim_trailing_zeros(s, dc);
         return s;
     }
 };

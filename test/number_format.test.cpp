@@ -163,12 +163,12 @@ void test_number_format()
     test_case("#", 123, "123");
     test_case("#.##", 123.4, "123.4");
     test_case("#.##", 123.456, "123.46");
-    test_case("#.##", 123, "123");
+    test_case("#.##", 123, "123.");
     test_case("#.##", 0.1, ".1");
     test_case("##.##", 0.1, ".1");
     test_case("#.00", 123.4, "123.40");
     test_case("0.##", 123.4, "123.4");
-    test_case("0.##", 123, "123");
+    test_case("0.##", 123, "123.");
 
     // Mixed 0 and #: # suppresses trailing zero at its position only
     test_case("0.0#", 0.10, "0.1");
@@ -545,6 +545,88 @@ void test_number_format()
     // Special: literal digit after placeholder via quoting
     test_case("0", 1e-10, "0");
     test_case("0.000000000\"1\"", 1e-10, "0.0000000001");
+
+    // ==========================================================================
+    // Trailing Decimal Point
+    // ECMA-376: decimal point in format code always appears in output when
+    //           there are no fractional placeholders (e.g., "0.", "#.").
+    // ==========================================================================
+    test_case("0.", 123, "123.");
+    test_case("0.", 0, "0.");
+    test_case("0.", 123.456, "123.");
+    test_case("0.", 123.5, "124.");
+    test_case("#.", 123, "123.");
+    test_case("#.", 0, ".");
+
+    // Decimal must show when integer part is non-empty (e.g., "0.#" value 0)
+    test_case("0.#", 0, "0.");
+    test_case("0.#", 0.5, "0.5");
+    test_case("0.#", 123, "123.");
+    // Decimal must also show for fraction ? placeholders
+    test_case("0.??", 0, "0.  ");
+    test_case("0.?", 0, "0. ");
+
+    // ==========================================================================
+    // Condition Fallback
+    // ECMA-376: when all sections have conditions and none matches, display
+    //           pound signs across the cell width.
+    // ==========================================================================
+    test_case("[>100]\"High\";[<0]\"Negative\"", 50, "###########");
+
+    // ==========================================================================
+    // Multiple Prefix Brackets
+    // ECMA-376: A section may have both a color and a condition prefix.
+    //           E.g., [Red][>100]0.00 and [>100][Red]0.00
+    // ==========================================================================
+    test_case("[Red][>100]0.00", 150, "150.00");
+    test_case("[>100][Red]0.00", 150, "150.00");
+    test_case("[Red]0;[>100]0", 100, "100");       // no condition match → unconditional (color) section
+    test_case("[Red]0;[>100]0", 150, "150");        // condition section matches
+    test_case("[Red]0;[>100]0", 50, "50");          // no condition match → first section
+
+    // ==========================================================================
+    // @ (text_placeholder) in number sections
+    // ECMA-376: When @ appears in a non-text section, it's treated as a literal.
+    // ==========================================================================
+    test_case("0.00\"@\"@", 1.5, "1.50@@");
+
+    // ==========================================================================
+    // Elapsed Seconds with Fractional Seconds: [s].00
+    // ECMA-376: .0/.00/.000 after seconds (including [s]) are fractional seconds
+    // ==========================================================================
+    test_case("[s].00", 0.5 / 86400.0, "0.50");
+    test_case("[s].00", 1.0 / 86400.0, "1.00");
+    test_case("[s].00", 0, "0.00");
+    test_case("[s].000", 0.5 / 86400.0, "0.500");
+
+    // ==========================================================================
+    // Elapsed Hours/Minutes with Fractional Parts: [h].00 and [m].00
+    // ECMA-376: .0/.00/.000 after elapsed time tokens are fractional parts
+    // ==========================================================================
+    test_case("[h].00", 0, "0.00");
+    test_case("[h].00", 1.5, "36.00");
+    test_case("[h].00", 1.51, "36.24");
+    test_case("[h].000", 1.5, "36.000");
+    test_case("[h].0", 1.51, "36.2");
+    test_case("[m].00", 0, "0.00");
+    test_case("[m].00", 0.5, "720.00");
+    test_case("[m].00", 0.5001, "720.14");
+    test_case("[m].000", 0.5, "720.000");
+    test_case("[m].0", 0.5001, "720.1");
+
+    // ==========================================================================
+    // Mixed #/? Fraction Placeholders
+    // ECMA-376: # suppresses, ? pads with space. They should not interfere.
+    // ==========================================================================
+    test_case("0.?#", 0.1, "0.1");
+    test_case("0.?#", 0.12, "0.12");
+    test_case("0.?#", 0, "0. ");
+    test_case("0.?0", 0.01, "0.01");
+    test_case("0.?0", 0.1, "0.10");
+
+    // ECMA-376: decimal point always appears when present in the format
+    test_case("#.#", 0, ".");
+    test_case("#.##", 123, "123.");
 
     // ==========================================================================
     // Summary
