@@ -8,7 +8,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 add_library(xlsxtext STATIC
     ${CMAKE_CURRENT_SOURCE_DIR}/xlsxtext/miniz/miniz.c
     ${CMAKE_CURRENT_SOURCE_DIR}/xlsxtext/pugixml/pugixml.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/xlsxtext/number_format_3.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/xlsxtext/number_format.cpp
 )
 target_include_directories(xlsxtext PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/xlsxtext

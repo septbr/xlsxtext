@@ -10,7 +10,7 @@
 //   number_format public  — Pimpl wrappers (thin delegation)
 // =============================================================================
 
-#include "number_format_3.hpp"
+#include "number_format.hpp"
 
 #include <algorithm>
 #include <array>
