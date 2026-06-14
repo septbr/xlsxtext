@@ -127,6 +127,22 @@ namespace
         return v >= 0 ? v % 7 : (v % 7 + 7) % 7;
     }
 
+    // Extract time components (hour, minute, second, fractional second) from
+    // a fractional day value.  Adds a tiny epsilon to compensate for
+    // floating-point error in frac * 86400 (e.g., 0.25017361111 → 21615.0,
+    // but fp may give 21614.999...).  Clamps fsec to [0, 1).
+    static void extract_time(double frac, int& hour, int& minute, int& second, double& fsec) noexcept
+    {
+        const double total_seconds = frac * 86400.0 + 1e-6;
+        hour = static_cast<int>(total_seconds) / 3600;
+        minute = (static_cast<int>(total_seconds) % 3600) / 60;
+        fsec = total_seconds - hour * 3600.0 - minute * 60.0;
+        second = static_cast<int>(std::floor(fsec));
+        fsec -= second;
+        if (fsec >= 1.0) fsec = std::nextafter(1.0, 0.0);
+        if (fsec < 0.0)  fsec = 0.0;
+    }
+
     // Convert Excel serial date number to date_parts.
     // Handles the 1900 leap-year bug (serial 60 = Feb 29, 1900).
     // Supports both 1900 and 1904 date systems.
@@ -135,21 +151,15 @@ namespace
         const int whole = static_cast<int>(std::floor(serial));
         const double frac = serial - whole;
 
+        int hour, minute, second;
+        double fsec;
+
         // ECMA-376: 1900 date system treats serial 0 as 1900-01-00
         // (the "zeroth" day of January, i.e. 1899-12-31 on the real calendar)
         if (!date1904 && whole == 0)
         {
-            // Add a tiny epsilon to compensate for floating-point error in frac * 86400.
-        // E.g., frac = 0.25017361111 → 21615.0, but fp may give 21614.999...
-        const double total_seconds = frac * 86400.0 + 1e-6;
-        const int hour = static_cast<int>(total_seconds) / 3600;
-        const int minute = (static_cast<int>(total_seconds) % 3600) / 60;
-        double fsec = total_seconds - hour * 3600.0 - minute * 60.0;
-        const int second = static_cast<int>(std::floor(fsec));
-        fsec -= second;
-        if (fsec >= 1.0) fsec = std::nextafter(1.0, 0.0);
-        if (fsec < 0.0)  fsec = 0.0;
-        return {1900, 1, 0, hour, minute, second, 6, fsec}; // 1900-01-00 = Saturday (day before 1900-01-01 Monday)
+            extract_time(frac, hour, minute, second, fsec);
+            return {1900, 1, 0, hour, minute, second, 6, fsec}; // 1900-01-00 = Saturday
         }
 
         // ECMA-376: 1900 date system treats serial 60 as 1900-02-29 (leap year bug)
@@ -158,14 +168,7 @@ namespace
             // calc_dow(1900,2,29) returns Thursday (same as 1900-03-01 in real calendar).
             // Excel says 1900-02-29 is Wednesday (dow offset -1 for the 1900 bug).
             const int dow = (calc_dow(1900, 2, 29) + 6) % 7;
-            const double total_seconds = frac * 86400.0 + 1e-6;
-            const int hour = static_cast<int>(total_seconds) / 3600;
-            const int minute = (static_cast<int>(total_seconds) % 3600) / 60;
-            double fsec = total_seconds - hour * 3600.0 - minute * 60.0;
-            const int second = static_cast<int>(std::floor(fsec));
-            fsec -= second;
-            if (fsec >= 1.0) fsec = std::nextafter(1.0, 0.0);
-            if (fsec < 0.0)  fsec = 0.0;
+            extract_time(frac, hour, minute, second, fsec);
             return {1900, 2, 29, hour, minute, second, dow, fsec};
         }
 
@@ -189,17 +192,8 @@ namespace
         int dow = calc_dow(y, m, d);
         if (!date1904 && whole >= 1 && whole <= 60)
             dow = (dow + 6) % 7; // -1 mod 7
-        // Add a tiny epsilon to compensate for floating-point error in frac * 86400.
-        const double total_seconds = frac * 86400.0 + 1e-6;
-        const int hour = static_cast<int>(total_seconds) / 3600;
-        const int minute = (static_cast<int>(total_seconds) % 3600) / 60;
-        double fsec = total_seconds - hour * 3600.0 - minute * 60.0;
-        const int second = static_cast<int>(std::floor(fsec));
-        fsec -= second;
-        // Clamp to [0, 1) to guard against floating-point error near boundaries
-        if (fsec >= 1.0) fsec = std::nextafter(1.0, 0.0);
-        if (fsec < 0.0)  fsec = 0.0;
 
+        extract_time(frac, hour, minute, second, fsec);
         return {y, m, d, hour, minute, second, dow, fsec};
     }
 
@@ -1028,10 +1022,31 @@ private:
     // Literal characters (including literal digits 1-9) do not reset the anchor.
     static int compute_scale(const std::vector<token>& tokens)
     {
-        // Find the decimal point position (or end of tokens)
+        // Find the decimal point position (or end of tokens).
+        // For fraction formats, also stop at the space separator before the
+        // fraction (e.g., "#,##0, ?/?") so that scaling commas after the
+        // integer part are not blocked by the numerator digits.
         int decimal_pos = static_cast<int>(tokens.size());
         for (int i = 0; i < static_cast<int>(tokens.size()); ++i)
+        {
             if (tokens[i].type == token_type::decimal) { decimal_pos = i; break; }
+            if (tokens[i].type == token_type::literal && tokens[i].literal == "/")
+            { decimal_pos = i; break; }
+            // Space separator before fraction: if we see a space followed by a
+            // digit placeholder and then a '/', treat it as the fraction boundary.
+            if (tokens[i].type == token_type::literal && tokens[i].literal == " ")
+            {
+                // Look ahead for a '/' to confirm this is a fraction separator
+                for (int j = i + 1; j < static_cast<int>(tokens.size()); ++j)
+                {
+                    if (tokens[j].type == token_type::literal && tokens[j].literal == "/")
+                    { decimal_pos = i; break; }
+                    if (!is_digit_token(tokens[j].type) && tokens[j].type != token_type::thousands)
+                        break;
+                }
+                if (decimal_pos == i) break;
+            }
+        }
 
         // Find boundaries of digit placeholders on the integer side
         int first_int_digit = -1;
@@ -1132,9 +1147,13 @@ public:
 private:
     static bool condition_matches(const section& sec, double number) noexcept
     {
-        // Scale epsilon relative to the condition value to handle both small
-        // and large thresholds correctly (e.g., [=1e-8] vs [=1e10]).
-        const double eps = float_epsilon * std::fmax(1.0, std::fabs(sec.condition_value));
+        // Use a tight epsilon based on double machine epsilon, scaled by the
+        // condition value magnitude.  float_epsilon (1e-10) is too loose for
+        // condition matching — it would treat 1.5+1e-10 as equal to 1.5.
+        // 1e-12 is tight enough to distinguish values differing by 1e-10
+        // while still accommodating genuine floating-point rounding errors.
+        constexpr double condition_epsilon = 1e-12;
+        const double eps = condition_epsilon * std::fmax(1.0, std::fabs(sec.condition_value));
         switch (sec.condition_op)
         {
         case section::cond_gt: return number > sec.condition_value + eps;
@@ -1246,6 +1265,12 @@ public:
         // minus is prepended.  This applies to the actually selected section for
         // this negative value, regardless of its index (important when conditional
         // sections reorder the effective negative section).
+        //
+        // Implementation note: in addition to skip/fill tokens, we also skip
+        // non-sign literals (e.g., "$") before the first digit placeholder.
+        // ECMA-376 is strict about "begins with" but Excel recognizes "-" or "("
+        // anywhere before the digits in the negative section (e.g., "$-0" works).
+        // This relaxation matches Excel behavior.
         bool neg_section_owns_sign = false;
         if (number < 0)
         {
@@ -1584,14 +1609,17 @@ public:
             // space-padding for alignment.  0 takes precedence over ?.
             // Numerator is left-padded (aligns with fraction bar on the right).
             // Denominator is left-padded with zeros, right-padded with spaces.
+            // Padding target is total digit count (num_digits), not just
+            // the count of a specific placeholder type, to handle mixed
+            // patterns like "?#" or "#?" correctly.
             if (fl.num_zeros > 0)
             {
                 if (static_cast<int>(num_str.size()) < fl.num_digits)
                     num_str.insert(0, static_cast<size_t>(fl.num_digits - static_cast<int>(num_str.size())), '0');
             }
-            else if (static_cast<int>(num_str.size()) < fl.num_qmarks)
+            else if (fl.num_qmarks > 0 && static_cast<int>(num_str.size()) < fl.num_digits)
             {
-                num_str.insert(0, static_cast<size_t>(fl.num_qmarks - static_cast<int>(num_str.size())), ' ');
+                num_str.insert(0, static_cast<size_t>(fl.num_digits - static_cast<int>(num_str.size())), ' ');
             }
 
             if (fl.den_zeros > 0)
@@ -1599,14 +1627,12 @@ public:
                 if (static_cast<int>(den_str.size()) < fl.den_digits)
                     den_str.insert(0, static_cast<size_t>(fl.den_digits - static_cast<int>(den_str.size())), '0');
             }
-            else if (static_cast<int>(den_str.size()) < fl.den_qmarks)
-            {
-                den_str.append(static_cast<size_t>(fl.den_qmarks - static_cast<int>(den_str.size())), ' ');
-            }
-            else if (static_cast<int>(den_str.size()) < fl.den_digits)
+            else if (fl.den_qmarks > 0 && static_cast<int>(den_str.size()) < fl.den_digits)
             {
                 den_str.append(static_cast<size_t>(fl.den_digits - static_cast<int>(den_str.size())), ' ');
             }
+            // ECMA-376: # placeholders do NOT pad with spaces — they only show
+            // the digit and suppress insignificant zeros/spaces.
         }
 
         // Walk tokens and assemble output
@@ -1839,7 +1865,12 @@ public:
         }
 
         // Count digit placeholders up to the E token for precision
-        const auto dc = count_digit_placeholders(sec, sci_pos);
+        auto dc = count_digit_placeholders(sec, sci_pos);
+        // ECMA-376: "When a number format includes the comma as a thousands
+        // separator and also includes an exponent (E+, E-, e+, or e-
+        // designator), the format shall be treated as if a thousands separator
+        // were not present."
+        dc.thousands = 0;
         const int total_int = dc.total_int();
         const int total_frac = dc.total_frac();
 
@@ -1866,16 +1897,18 @@ public:
             else if (mantissa >= norm_range - 1e-12 * norm_range) { mantissa /= 10.0; ++exponent; }
         }
 
-        // Round mantissa to the specified fractional precision.
+        // Round mantissa to the specified total precision (integer + fractional digits).
+        // When total_frac == 0, round to the nearest integer.
         // Epsilon added AFTER scaling, capped below 0.5 to prevent corrupting exact values.
-        // Only applied when there are fractional digits to round.
         const double round_factor = pow10_safe(total_frac);
-        const double m_scaled = mantissa * round_factor;
-        const double m_eps = (total_frac > 0)
-            ? std::fmin(0.499999999999999,
-                std::fmax(float_epsilon, std::fabs(m_scaled) * std::numeric_limits<double>::epsilon()))
-            : 0.0;
-        mantissa = std::round(m_scaled + m_eps) / round_factor;
+        {
+            const double m_scaled = mantissa * round_factor;
+            const double m_eps = (total_frac > 0)
+                ? std::fmin(0.499999999999999,
+                    std::fmax(float_epsilon, std::fabs(m_scaled) * std::numeric_limits<double>::epsilon()))
+                : 0.0;
+            mantissa = std::round(m_scaled + m_eps) / round_factor;
+        }
 
         // Handle rounding overflow: mantissa may have rounded up to the normalization
         // range boundary.  Divide by 10 and bump exponent (rather than collapsing
@@ -1957,7 +1990,11 @@ public:
         }
         // ECMA-376: when the exponent pattern is all '#' and abs_exp == 0,
         // all digits would be suppressed.  Ensure at least one digit remains.
-        if (exp_str.empty()) exp_str = "0";
+        // Also handle mixed patterns like "?#" where one position pads with
+        // space and the other suppresses — result may be non-empty but
+        // contain no digits (e.g., " ").
+        if (exp_str.find_first_of("0123456789") == std::string::npos)
+            exp_str += '0';
 
         // Walk tokens to build output, preserving surrounding text (literals, skips, fills)
         std::string result;
@@ -2303,8 +2340,8 @@ private:
             if (before)
             {
                 if (pat == '#') continue;                     // suppressed
-                if (pat == '?') groups[i] = std::string(end - start, ' '); // space
-                else            groups[i] = std::string(end - start, '0'); // zero
+                if (pat == '?') groups[i] = std::string(end - start, ' ');
+                else            groups[i] = std::string(end - start, '0');
             }
             else
             {
@@ -2352,7 +2389,10 @@ private:
             if (padded[i] != '0') { first_nonzero = static_cast<int>(i); break; }
         if (first_nonzero < 0) first_nonzero = static_cast<int>(padded.size());
 
-        // Build output directly from the pattern
+        // Build output directly from the pattern.
+        // ECMA-376: # does not display extra zeros. It suppresses the zero
+        // digit regardless of whether a 0 placeholder to its left has already
+        // forced output (e.g., "0#" with value 0 → "0", not "00").
         std::string result;
         result.reserve(padded.size() + dc.thousands);
         for (size_t i = 0; i < padded.size(); ++i)
@@ -2362,9 +2402,9 @@ private:
 
             if (before)
             {
-                if (pat == '#') continue;          // suppress
-                if (pat == '?') result += ' ';      // space for alignment
-                else result += '0';                  // '0' placeholder
+                if (pat == '#') continue; // suppress
+                if (pat == '?') result += ' ';
+                else            result += '0';
             }
             else
             {
