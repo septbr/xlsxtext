@@ -131,7 +131,7 @@ namespace
     // a fractional day value.  Adds a tiny epsilon to compensate for
     // floating-point error in frac * 86400 (e.g., 0.25017361111 → 21615.0,
     // but fp may give 21614.999...).  Clamps fsec to [0, 1).
-    static void extract_time(double frac, int& hour, int& minute, int& second, double& fsec) noexcept
+    void extract_time(double frac, int& hour, int& minute, int& second, double& fsec) noexcept
     {
         const double total_seconds = frac * 86400.0 + 1e-6;
         hour = static_cast<int>(total_seconds) / 3600;
@@ -820,8 +820,7 @@ private:
             // ---- Characters that are literal without escaping (§18.8.31) ----
             if (c == '$' || c == '(' || c == ')' || c == '-' || c == '+' || c == ' ' ||
                 c == '!' || c == '^' || c == '&' || c == '\'' || c == '~' ||
-                c == '{' || c == '}' || c == '<' || c == '>' || c == '=' ||
-                c == '`' || c == '|')
+                c == '{' || c == '}' || c == '<' || c == '>' || c == '=')
             {
                 tokens.push_back({token_type::literal, 0, std::string(1, c)});
                 ++pos; continue;
@@ -1250,8 +1249,16 @@ public:
         if (!sec) return std::string(default_cell_width, '#');
 
         // ECMA-376: empty sections fall back to the first section's format.
+        // If the first section is also empty (e.g., condition-only section),
+        // find the first non-empty unconditional section.
         if (sec->tokens.empty() && !sections.empty())
-            sec = &sections[0];
+        {
+            if (!sections[0].tokens.empty())
+                sec = &sections[0];
+            else
+                for (auto& s : sections)
+                    if (!s.tokens.empty()) { sec = &s; break; }
+        }
 
         const section_info info = analyze_section(*sec);
 
@@ -1390,10 +1397,14 @@ public:
         // Fractional seconds value — may be overridden by elapsed_seconds below
         double frac_sec = dp.fsec;
 
-        // Track whether we are in an elapsed-time chain.
-        // When true, subsequent elapsed tokens use frac_sec as the remainder
-        // rather than recomputing from raw_value.
+        // Track the fractional remainder of the elapsed-time chain in days.
+        // When in_elapsed_chain is true, subsequent elapsed tokens use
+        // chain_frac_days as the source rather than raw_value.  Storing in
+        // days (rather than in the previous unit) ensures correct conversion
+        // regardless of which elapsed unit follows (e.g., [h]:[s] correctly
+        // converts hours→seconds, not minutes→seconds).
         bool in_elapsed_chain = false;
+        double chain_frac_days = 0.0;
 
         std::string result;
         result.reserve(sec.tokens.size() * 4);
@@ -1424,33 +1435,39 @@ public:
             case token_type::second_ss:
                 append_padded(result, dp.second, tok.repeat);
                 frac_sec = dp.fsec; // reset to fractional seconds from serial
+                chain_frac_days = 0.0;
                 in_elapsed_chain = false;
                 break;
             case token_type::am_pm:       append_ampm(result, tok.literal, dp.hour >= 12); break;
             case token_type::frac_second: append_frac_second(result, frac_sec, tok.repeat); break;
             case token_type::elapsed_hours: {
-                const double total_hrs = raw_value * 24;
+                const double src = in_elapsed_chain ? chain_frac_days : raw_value;
+                const double total_hrs = src * 24;
+                const double rem = total_hrs - std::floor(total_hrs);
                 append_padded(result, static_cast<long long>(std::floor(total_hrs)), tok.repeat);
-                frac_sec = total_hrs - std::floor(total_hrs);
+                chain_frac_days = rem / 24;
                 in_elapsed_chain = true;
+                frac_sec = rem;
                 break;
             }
             case token_type::elapsed_minutes: {
-                const double total_mins = in_elapsed_chain
-                    ? frac_sec * 60
-                    : raw_value * 24 * 60;
+                const double src = in_elapsed_chain ? chain_frac_days : raw_value;
+                const double total_mins = src * 24 * 60;
+                const double rem = total_mins - std::floor(total_mins);
                 append_padded(result, static_cast<long long>(std::floor(total_mins)), tok.repeat);
-                frac_sec = total_mins - std::floor(total_mins);
+                chain_frac_days = rem / (24 * 60);
                 in_elapsed_chain = true;
+                frac_sec = rem;
                 break;
             }
             case token_type::elapsed_seconds: {
-                const double total_secs = in_elapsed_chain
-                    ? frac_sec * 60
-                    : raw_value * 24 * 3600;
+                const double src = in_elapsed_chain ? chain_frac_days : raw_value;
+                const double total_secs = src * 24 * 3600;
+                const double rem = total_secs - std::floor(total_secs);
                 append_padded(result, static_cast<long long>(std::floor(total_secs)), tok.repeat);
-                frac_sec = total_secs - std::floor(total_secs);
+                chain_frac_days = rem / (24 * 3600);
                 in_elapsed_chain = true;
+                frac_sec = rem;
                 break;
             }
             default:
@@ -1575,9 +1592,13 @@ public:
 
         const bool no_fraction = (best_num == 0);
 
-        // Format integer part via std::to_chars on double (avoids long long overflow)
-        char int_buf[64];
+        // Format integer part via std::to_chars on double (avoids long long overflow).
+        // Buffer must be large enough for the maximum double value (~1.8e308
+        // has 309 integer digits) plus null terminator.
+        char int_buf[320];
         auto r = std::to_chars(int_buf, int_buf + sizeof(int_buf), int_part_d, std::chars_format::fixed, 0);
+        if (r.ec != std::errc())
+            return std::string(default_cell_width, '#');
         std::string int_str = format_integer_str(std::string(int_buf, r.ptr), fl.int_counts);
         bool int_suppressed = int_str.empty();
 
@@ -2118,9 +2139,13 @@ public:
         const bool is_zero_rounded = (int_part_d == 0.0 && frac_val == 0);
         const bool effective_negative = negative && !is_zero_rounded;
 
-        // Format integer part as string (avoids long long overflow for large values)
-        char int_buf[64];
+        // Format integer part as string (avoids long long overflow for large values).
+        // Buffer must be large enough for the maximum double value (~1.8e308
+        // has 309 integer digits) plus null terminator.
+        char int_buf[320];
         auto int_r = std::to_chars(int_buf, int_buf + sizeof(int_buf), int_part_d, std::chars_format::fixed, 0);
+        if (int_r.ec != std::errc())
+            return std::string(default_cell_width, '#');
         const std::string int_str_raw(int_buf, int_r.ptr);
 
         // Format integer and fraction strings
