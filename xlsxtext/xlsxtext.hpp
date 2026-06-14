@@ -2,7 +2,7 @@
 
 #include "miniz/miniz.h"
 #include "pugixml/pugixml.hpp"
-#include "number_format_3.hpp"
+#include "number_format.hpp"
 
 #include <cstring>
 #include <string>
