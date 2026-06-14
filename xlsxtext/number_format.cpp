@@ -1,15 +1,3 @@
-// =============================================================================
-// number_format_3.cpp — Excel number format string parser & formatter
-//
-// Implements ECMA-376 Part 1 §18.8.31 (numFmt / formatCode) semantics.
-// Reference: ISO/IEC 29500-1:2016 (Office Open XML File Formats)
-//
-// Architecture:
-//   anonymous namespace — pure math/date helpers, no dependency on impl
-//   number_format::impl   — all parsing, analysis, and formatting logic
-//   number_format public  — Pimpl wrappers (thin delegation)
-// =============================================================================
-
 #include "number_format.hpp"
 
 #include <algorithm>

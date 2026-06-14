@@ -1,10 +1,3 @@
-// =============================================================================
-// number_format_3.hpp — v8: Pimpl idiom — zero implementation details in header
-//
-// Includes reduced from 3→2.  All nested types, private methods, and data
-// members hidden behind std::unique_ptr<impl>.  Recompilation-free when
-// formatting logic changes.
-// =============================================================================
 #pragma once
 
 #include <memory>
