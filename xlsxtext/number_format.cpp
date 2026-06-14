@@ -83,13 +83,6 @@ namespace
 
     // ---- fast integer-to-string (no heap allocation) ----
 
-    void append_int(std::string& out, int val) noexcept
-    {
-        char buf[16];
-        auto r = std::to_chars(buf, buf + 16, val);
-        out.append(buf, r.ptr);
-    }
-
     // Append val with leading zeros to fill at least `width` characters.
     void append_padded(std::string& out, long long val, int width) noexcept
     {
@@ -199,12 +192,13 @@ namespace
             if (n > d) continue;
             const double err = std::fabs(frac - static_cast<double>(n) / d);
             if (err < best_err - 1e-12) { best_err = err; best_num = n; best_den = d; }
+            else if (std::fabs(err - best_err) < 1e-12 && d < best_den) { best_num = n; best_den = d; }
         }
 
         // Reduce fraction to lowest terms
         if (best_num > 0 && best_den > 1)
         {
-            const auto g = std::gcd(static_cast<long long>(best_num), static_cast<long long>(best_den));
+            const auto g = std::gcd(best_num, best_den);
             if (g > 1) { best_num /= g; best_den /= g; }
         }
     }
@@ -1173,6 +1167,10 @@ public:
         // pound signs ("#") are displayed across the width of the cell."
         if (!sec) return std::string(default_cell_width, '#');
 
+        // ECMA-376: empty sections fall back to the first section's format.
+        if (sec->tokens.empty() && !sections.empty())
+            sec = &sections[0];
+
         const section_info info = analyze_section(*sec);
 
         // No digit or date/time tokens → pure literal template (handles text sections with @)
@@ -1192,12 +1190,17 @@ public:
             {
                 if (tok.type == token_type::skip || tok.type == token_type::fill)
                     continue;
+                // Literal tokens before the digits: if "-" or "(" is found
+                // anywhere before the first digit placeholder, the section
+                // owns the sign (ECMA-376: "to the left of the digit
+                // placeholder").  Non-sign literals (e.g., "$") are skipped.
                 if (tok.type == token_type::literal)
                 {
                     if (tok.literal == "-" || tok.literal == "(")
                     { neg_section_owns_sign = true; break; }
+                    continue;
                 }
-                break; // first non-skip non-fill token is not a sign → no sign owned
+                break; // first non-literal, non-skip, non-fill → digit or other
             }
         }
 
@@ -1215,14 +1218,36 @@ public:
 
 private:
     // Render a section that has no digit or date/time tokens — just literals,
-    // text placeholders, and skip tokens.
+    // text placeholders, skip tokens, and other non-digit tokens that should
+    // appear as their literal equivalents.
     static std::string render_literal_template(const section& sec, double number)
     {
         std::string result;
         for (auto& tok : sec.tokens)
         {
-            if (tok.type == token_type::text_placeholder) result += format_number_general(number);
-            else append_common_token(result, tok);
+            if (tok.type == token_type::text_placeholder)
+                result += format_number_general(number);
+            else if (append_common_token(result, tok))
+                continue;
+            else
+            {
+                // Output non-digit tokens as their literal text equivalents
+                switch (tok.type)
+                {
+                case token_type::percent:  result += '%'; break;
+                case token_type::thousands: result += ','; break;
+                case token_type::decimal:  result += '.'; break;
+                case token_type::digit_zero:  result += '0'; break;
+                case token_type::digit_hash:  result += '#'; break;
+                case token_type::digit_qmark: result += '?'; break;
+                case token_type::scientific:
+                    result += tok.exp_upper_case ? 'E' : 'e';
+                    result += tok.exp_plus_sign ? '+' : '-';
+                    result += tok.exp_pattern;
+                    break;
+                default: break;
+                }
+            }
         }
         return result;
     }
@@ -1286,12 +1311,12 @@ public:
             {
             case token_type::year_2:      append_padded(result, dp.year % 100, 2); break;
             case token_type::year_4:      append_padded(result, dp.year, tok.repeat); break;
-            case token_type::month_n:     append_int(result, dp.month); break;
+            case token_type::month_n:     append_padded(result, dp.month, 0); break;
             case token_type::month_nn:    append_padded(result, dp.month, 2); break;
             case token_type::month_mmm:   result += month_abbr[month_idx]; break;
             case token_type::month_mmmm:  result += month_names[month_idx]; break;
             case token_type::month_mmmmm: result += month_names[month_idx][0]; break;
-            case token_type::day_d:       append_int(result, dp.day); break;
+            case token_type::day_d:       append_padded(result, dp.day, 0); break;
             case token_type::day_dd:      append_padded(result, dp.day, 2); break;
             case token_type::day_ddd:     result += day_abbr[static_cast<size_t>(dp.dow)]; break;
             case token_type::day_dddd:    result += day_names[static_cast<size_t>(dp.dow)]; break;
@@ -1502,6 +1527,10 @@ public:
             {
                 den_str.append(static_cast<size_t>(fl.den_qmarks - static_cast<int>(den_str.size())), ' ');
             }
+            else if (static_cast<int>(den_str.size()) < fl.den_digits)
+            {
+                den_str.append(static_cast<size_t>(fl.den_digits - static_cast<int>(den_str.size())), ' ');
+            }
         }
 
         // Walk tokens and assemble output
@@ -1663,7 +1692,7 @@ private:
             // leftmost and rightmost integer digits in the fraction's integer part).
             // Leading or trailing commas are scaling commas handled by compute_scale.
             //
-            // First pass: find digit boundaries (in L-to-R index order)
+            // First pass: find digit boundaries (leftmost and rightmost)
             int leftmost_digit = sep_pos;
             int rightmost_digit = -1;
             for (int i = sep_pos - 1; i >= 0; --i)
@@ -1673,18 +1702,10 @@ private:
                     tt == token_type::digit_qmark || is_frac_literal_digit(sec.tokens[i]))
                 {
                     leftmost_digit = i;
+                    if (rightmost_digit < 0) rightmost_digit = i;
                 }
                 else if (tt != token_type::thousands)
                     break;
-            }
-            for (int i = sep_pos - 1; i >= 0; --i)
-            {
-                const auto tt = sec.tokens[i].type;
-                if (tt == token_type::digit_zero || tt == token_type::digit_hash ||
-                    tt == token_type::digit_qmark || is_frac_literal_digit(sec.tokens[i]))
-                {
-                    rightmost_digit = i; break;
-                }
             }
 
             // Second pass: count placeholders and grouping commas
@@ -1809,7 +1830,8 @@ public:
 
         // Suppress negative sign when the rounded value is zero.
         // ECMA-376: negative values that round to zero display as "0E+00" (not "-0E+00").
-        const bool sci_is_zero_rounded = (m_int == 0 && m_int_str == "0"
+        const bool sci_is_zero_rounded = (m_int == 0
+            && m_int_str.find_first_not_of('0') == std::string::npos
             && (m_frac_str.empty() || m_frac_str.find_first_not_of("0 ") == std::string::npos));
         const bool sci_effective_negative = negative && !sci_is_zero_rounded;
 
