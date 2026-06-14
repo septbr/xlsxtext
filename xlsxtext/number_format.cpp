@@ -2090,6 +2090,11 @@ public:
         std::string int_str = format_integer_str(int_str_raw, dc);
         std::string frac_str = format_decimal_str(frac_val, total_frac, dc);
 
+        // Pre-compute digit groups for each integer placeholder so that
+        // literals between placeholders (e.g., 0"#"0) are embedded
+        // between digit groups rather than appended after the integer part.
+        std::vector<std::string> int_digit_groups = compute_int_digit_groups(int_str_raw, dc);
+
         // Walk tokens and assemble output
         std::string result;
         result.reserve(int_str.size() + frac_str.size() + 16);
@@ -2097,6 +2102,7 @@ public:
 
         bool past_decimal = false;
         bool int_output = false;
+        int int_placeholder_index = 0;
         int frac_pos = 0;
 
         for (auto& tok : sec.tokens)
@@ -2111,7 +2117,7 @@ public:
                 result += '.';
                 past_decimal = true;
                 break;
-            case token_type::thousands: break; // handled by format_integer_str
+            case token_type::thousands: break; // handled by post-loop comma insertion
             case token_type::percent: result += '%'; break;
             case token_type::text_placeholder: result += '@'; break;
             case token_type::scientific:
@@ -2122,7 +2128,15 @@ public:
             case token_type::digit_zero: case token_type::digit_hash: case token_type::digit_qmark:
                 if (!past_decimal)
                 {
-                    if (!int_output) { result += int_str; int_output = true; }
+                    if (!int_digit_groups.empty())
+                    {
+                        if (int_placeholder_index < static_cast<int>(int_digit_groups.size()))
+                        {
+                            result += int_digit_groups[int_placeholder_index];
+                            ++int_placeholder_index;
+                        }
+                        int_output = true;
+                    }
                 }
                 else
                 {
@@ -2130,6 +2144,38 @@ public:
                     else if (tok.type == token_type::digit_qmark) result += ' '; // ? → space
                 }
                 break;
+            }
+        }
+
+        // Insert thousands separators into the integer part of the result.
+        // Separators are placed between digit characters every 3 digits from
+        // the right, regardless of literals embedded between digit placeholders.
+        if (dc.thousands > 0)
+        {
+            const size_t dot = result.find('.');
+            const size_t end = (dot != std::string::npos) ? dot : result.size();
+
+            int digit_count = 0;
+            for (size_t i = 0; i < end; ++i)
+                if (result[i] >= '0' && result[i] <= '9')
+                    ++digit_count;
+
+            if (digit_count > 3)
+            {
+                std::string with_commas;
+                with_commas.reserve(result.size() + (digit_count - 1) / 3);
+                int digits_seen = 0;
+                for (size_t i = 0; i < result.size(); ++i)
+                {
+                    if (i < end && result[i] >= '0' && result[i] <= '9')
+                    {
+                        if (digits_seen > 0 && (digit_count - digits_seen) % 3 == 0)
+                            with_commas += ',';
+                        ++digits_seen;
+                    }
+                    with_commas += result[i];
+                }
+                result = std::move(with_commas);
             }
         }
 
@@ -2206,6 +2252,66 @@ private:
             }
         }
         return dc;
+    }
+
+    // Pre-compute the digit group for each integer placeholder so that
+    // literals between digit placeholders (e.g., 0"#"0) are correctly
+    // embedded between digit groups instead of appended after the
+    // entire integer part.
+    static std::vector<std::string> compute_int_digit_groups(
+        const std::string& int_str_raw, const digit_counts& dc)
+    {
+        const int total = dc.total_int();
+        if (total <= 0) return {};
+
+        // Pad to the total number of integer placeholders
+        std::string padded = int_str_raw;
+        if (static_cast<int>(padded.size()) < total)
+            padded.insert(0, static_cast<size_t>(total - static_cast<int>(padded.size())), '0');
+
+        const int N = static_cast<int>(padded.size());
+
+        // Find first non-zero digit
+        int first_nonzero = -1;
+        for (size_t i = 0; i < padded.size(); ++i)
+            if (padded[i] != '0') { first_nonzero = static_cast<int>(i); break; }
+        if (first_nonzero < 0) first_nonzero = N;
+
+        std::vector<std::string> groups(total);
+        for (int i = 0; i < total; ++i)
+        {
+            // Determine the range of padded characters for this placeholder.
+            // Extra digits (N > total) go to the rightmost placeholder.
+            int start, end;
+            if (i == total - 1)
+            {
+                start = total - 1;
+                end = N;  // rightmost gets remaining chars
+            }
+            else
+            {
+                start = i;
+                end = i + 1;
+            }
+            if (start < 0) start = 0;
+            if (end > N) end = N;
+            if (start >= end) continue;  // no digits for this placeholder
+
+            const bool before = (start < first_nonzero);
+            const char pat = (i < static_cast<int>(dc.int_pattern.size())) ? dc.int_pattern[i] : '0';
+
+            if (before)
+            {
+                if (pat == '#') continue;                     // suppressed
+                if (pat == '?') groups[i] = std::string(end - start, ' '); // space
+                else            groups[i] = std::string(end - start, '0'); // zero
+            }
+            else
+            {
+                groups[i] = padded.substr(start, end - start);
+            }
+        }
+        return groups;
     }
 
     // Format the integer part of a regular number.
