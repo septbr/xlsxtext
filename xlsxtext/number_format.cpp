@@ -135,11 +135,30 @@ namespace
         const int whole = static_cast<int>(std::floor(serial));
         const double frac = serial - whole;
 
+        // ECMA-376: 1900 date system treats serial 0 as 1900-01-00
+        // (the "zeroth" day of January, i.e. 1899-12-31 on the real calendar)
+        if (!date1904 && whole == 0)
+        {
+            // Add a tiny epsilon to compensate for floating-point error in frac * 86400.
+        // E.g., frac = 0.25017361111 → 21615.0, but fp may give 21614.999...
+        const double total_seconds = frac * 86400.0 + 1e-6;
+        const int hour = static_cast<int>(total_seconds) / 3600;
+        const int minute = (static_cast<int>(total_seconds) % 3600) / 60;
+        double fsec = total_seconds - hour * 3600.0 - minute * 60.0;
+        const int second = static_cast<int>(std::floor(fsec));
+        fsec -= second;
+        if (fsec >= 1.0) fsec = std::nextafter(1.0, 0.0);
+        if (fsec < 0.0)  fsec = 0.0;
+        return {1900, 1, 0, hour, minute, second, 6, fsec}; // 1900-01-00 = Saturday (day before 1900-01-01 Monday)
+        }
+
         // ECMA-376: 1900 date system treats serial 60 as 1900-02-29 (leap year bug)
         if (!date1904 && whole == 60)
         {
-            const int dow = calc_dow(1900, 2, 29);
-            const double total_seconds = frac * 86400.0;
+            // calc_dow(1900,2,29) returns Thursday (same as 1900-03-01 in real calendar).
+            // Excel says 1900-02-29 is Wednesday (dow offset -1 for the 1900 bug).
+            const int dow = (calc_dow(1900, 2, 29) + 6) % 7;
+            const double total_seconds = frac * 86400.0 + 1e-6;
             const int hour = static_cast<int>(total_seconds) / 3600;
             const int minute = (static_cast<int>(total_seconds) % 3600) / 60;
             double fsec = total_seconds - hour * 3600.0 - minute * 60.0;
@@ -162,9 +181,16 @@ namespace
         int y, m, d;
         civil_from_days(epoch_days + real_days, y, m, d);
 
-        // Compute dow from the actual civil date — correct for all serials and both date systems
-        const int dow = calc_dow(y, m, d);
-        const double total_seconds = frac * 86400.0;
+        // Compute dow from the actual civil date.
+        // For serials 1-60 in the 1900 date system: Excel treats 1900 as a leap
+        // year and 1900-01-01 as Sunday (real is Monday), so dow is off by -1.
+        // For serials > 60: the fake Feb 29 shifts the date mapping but the dow
+        // of the real calendar date matches Excel's dow.
+        int dow = calc_dow(y, m, d);
+        if (!date1904 && whole >= 1 && whole <= 60)
+            dow = (dow + 6) % 7; // -1 mod 7
+        // Add a tiny epsilon to compensate for floating-point error in frac * 86400.
+        const double total_seconds = frac * 86400.0 + 1e-6;
         const int hour = static_cast<int>(total_seconds) / 3600;
         const int minute = (static_cast<int>(total_seconds) % 3600) / 60;
         double fsec = total_seconds - hour * 3600.0 - minute * 60.0;
@@ -493,10 +519,13 @@ private:
                 in_quote = !in_quote;
                 continue;
             }
+            // Backslash escape must be checked before ;, [, ] so that
+            // escaped ; is not treated as a section separator, and escaped
+            // brackets are not treated as bracket delimiters.
+            if (!in_quote && c == '\\' && i + 1 < fmt.size())      { cur += c; cur += fmt[++i]; continue; }
             if (!in_quote && c == '[')         { in_bracket = true; cur += c; continue; }
             if (!in_quote && c == ']')         { in_bracket = false; cur += c; continue; }
             if (!in_quote && !in_bracket && c == ';') { result.push_back(cur); cur.clear(); continue; }
-            if (c == '\\' && i + 1 < fmt.size())      { cur += c; cur += fmt[++i]; continue; }
             cur += c;
         }
         result.push_back(cur);
@@ -629,13 +658,21 @@ private:
             }
             if (c == '_' && pos + 1 < raw.size())  // Skip width of next char
             {
-                tokens.push_back({token_type::skip, 0, std::string(1, raw[pos + 1])});
-                pos += 2; continue;
+                char target = raw[pos + 1];
+                int skip = 2;
+                if (target == '\\' && pos + 2 < raw.size())
+                { target = raw[pos + 2]; skip = 3; }
+                tokens.push_back({token_type::skip, 0, std::string(1, target)});
+                pos += skip; continue;
             }
             if (c == '*' && pos + 1 < raw.size())  // Fill with next char
             {
-                tokens.push_back({token_type::fill, 0, std::string(1, raw[pos + 1])});
-                pos += 2; continue;
+                char target = raw[pos + 1];
+                int skip = 2;
+                if (target == '\\' && pos + 2 < raw.size())
+                { target = raw[pos + 2]; skip = 3; }
+                tokens.push_back({token_type::fill, 0, std::string(1, target)});
+                pos += skip; continue;
             }
             if (c == '@')  // Text placeholder
             {
@@ -812,6 +849,11 @@ private:
     // (e.g. h:mm:ss, [h]:mm:ss), so m/mm adjacent to ":" is also resolved as
     // minutes — this is the only logical interpretation consistent with the
     // standard's own examples.
+    //
+    // Second pass: resolve m/mm tokens that appear between an hour token
+    // (h/hh, [h]) and a second token (s/ss) anywhere in the same section,
+    // even with non-token separators (spaces, etc.) in between.  This handles
+    // patterns like "hh mm ss".
     static void resolve_mm_ambiguity(std::vector<raw_token>& tokens)
     {
         for (size_t i = 0; i < tokens.size(); ++i)
@@ -826,6 +868,27 @@ private:
             const bool col_after  = (i + 1 < tokens.size() && tokens[i + 1].type == token_type::literal && tokens[i + 1].lit == ":");
 
             if (after_h || before_s || col_before || col_after)
+            {
+                rt.type = (rt.type == token_type::month_nn) ? token_type::minute_mm : token_type::minute_m;
+                continue;
+            }
+
+            // Second pass: check if m/mm is between an hour token and a second
+            // token within the same section (ignoring non-token separators).
+            bool has_hour_before = false;
+            for (size_t j = 0; j < i; ++j)
+            {
+                if (tokens[j].type == token_type::hour_h || tokens[j].type == token_type::hour_hh ||
+                    tokens[j].type == token_type::elapsed_hours)
+                { has_hour_before = true; break; }
+            }
+            bool has_second_after = false;
+            for (size_t j = i + 1; j < tokens.size(); ++j)
+            {
+                if (tokens[j].type == token_type::second_s || tokens[j].type == token_type::second_ss)
+                { has_second_after = true; break; }
+            }
+            if (has_hour_before && has_second_after)
                 rt.type = (rt.type == token_type::month_nn) ? token_type::minute_mm : token_type::minute_m;
         }
     }
@@ -1302,6 +1365,11 @@ public:
         // Fractional seconds value — may be overridden by elapsed_seconds below
         double frac_sec = dp.fsec;
 
+        // Track whether we are in an elapsed-time chain.
+        // When true, subsequent elapsed tokens use frac_sec as the remainder
+        // rather than recomputing from raw_value.
+        bool in_elapsed_chain = false;
+
         std::string result;
         result.reserve(sec.tokens.size() * 4);
 
@@ -1330,7 +1398,8 @@ public:
             case token_type::second_s:
             case token_type::second_ss:
                 append_padded(result, dp.second, tok.repeat);
-                frac_sec = dp.fsec; // reset to fractional seconds after elapsed hours/minutes
+                frac_sec = dp.fsec; // reset to fractional seconds from serial
+                in_elapsed_chain = false;
                 break;
             case token_type::am_pm:       append_ampm(result, tok.literal, dp.hour >= 12); break;
             case token_type::frac_second: append_frac_second(result, frac_sec, tok.repeat); break;
@@ -1338,18 +1407,25 @@ public:
                 const double total_hrs = raw_value * 24;
                 append_padded(result, static_cast<long long>(std::floor(total_hrs)), tok.repeat);
                 frac_sec = total_hrs - std::floor(total_hrs);
+                in_elapsed_chain = true;
                 break;
             }
             case token_type::elapsed_minutes: {
-                const double total_mins = raw_value * 24 * 60;
+                const double total_mins = in_elapsed_chain
+                    ? frac_sec * 60
+                    : raw_value * 24 * 60;
                 append_padded(result, static_cast<long long>(std::floor(total_mins)), tok.repeat);
                 frac_sec = total_mins - std::floor(total_mins);
+                in_elapsed_chain = true;
                 break;
             }
             case token_type::elapsed_seconds: {
-                const double total_secs = raw_value * 24 * 3600;
+                const double total_secs = in_elapsed_chain
+                    ? frac_sec * 60
+                    : raw_value * 24 * 3600;
                 append_padded(result, static_cast<long long>(std::floor(total_secs)), tok.repeat);
                 frac_sec = total_secs - std::floor(total_secs);
+                in_elapsed_chain = true;
                 break;
             }
             default:
@@ -1824,8 +1900,11 @@ public:
             m_frac_str = format_decimal_str(fv, total_frac, dc);
         }
 
-        // If all placeholders are # (no 0) and the mantissa is zero, ensure at least "0" is shown.
-        if (m_int_str.empty() && m_frac_str.empty())
+        // If no integer part was produced and there are no integer placeholders
+        // (e.g., format is just ".00E+00"), force "0" before the decimal.
+        // ECMA-376: # suppresses insignificant zeros, so all-# integer with
+        // zero value produces empty (e.g., "#.##0E+00" with 0 → ".000E+00").
+        if (m_int_str.empty() && dc.total_int() == 0)
             m_int_str = "0";
 
         // Suppress negative sign when the rounded value is zero.
@@ -2140,10 +2219,13 @@ private:
     // This directly builds the correct output without fragile space-marking.
     static std::string format_integer_str(const std::string& int_str_raw, const digit_counts& dc)
     {
-        // Handle zero value with no mandatory zero placeholders
+        // Handle zero value with no mandatory zero placeholders.
+        // ECMA-376: # suppresses insignificant zeros. If the integer part
+        // has only # placeholders (no 0 or ?), zero should display as empty.
+        // If there are ? placeholders, show spaces for alignment.
         if (int_str_raw == "0")
         {
-            if (dc.int_zeros == 0 && (dc.int_hashes > 0 || dc.int_qmarks > 0))
+            if (dc.int_zeros == 0)
             {
                 if (dc.int_qmarks > 0)
                     return std::string(dc.int_qmarks, ' ');
